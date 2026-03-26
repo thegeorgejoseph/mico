@@ -58,7 +58,11 @@ fn release(spec: &str) -> anyhow::Result<()> {
         "git",
         &["commit", "-m", &format!("chore: release v{next}")],
     )?;
-    run_checked(&root, "git", &["tag", &format!("v{next}")])?;
+    run_checked(
+        &root,
+        "git",
+        &["tag", "-a", &format!("v{next}"), "-m", &format!("v{next}")],
+    )?;
     run_checked(&root, "git", &["push", "origin", "main", "--follow-tags"])?;
 
     Ok(())
