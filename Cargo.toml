@@ -10,7 +10,7 @@ as_conversions = "deny"
 
 [package]
 name = "mico"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Mission control for local CLI AI agents"
 license = "MIT"
