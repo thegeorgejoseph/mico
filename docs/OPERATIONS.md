@@ -7,7 +7,9 @@ This doc covers packaging and distribution details for `mico`.
 Homebrew is the recommended install path because it can pull in `tmux` automatically:
 
 ```sh
-brew install <tap>/mico
+brew tap thegeorgejoseph/tap
+brew install thegeorgejoseph/tap/mico
+mico
 ```
 
 There is also a GitHub Releases bootstrap path through `install.sh`:
@@ -53,3 +55,27 @@ GitHub Actions then builds the Apple Silicon binary and uploads:
 
 - `mico-<version>-aarch64-apple-darwin.tar.gz`
 - `mico-<version>-aarch64-apple-darwin.tar.gz.sha256`
+
+## Homebrew Tap Update
+
+If you want the tap formula updated from the same laptop workflow, use:
+
+```sh
+make ship
+```
+
+For a non-patch release:
+
+```sh
+make ship BUMP=minor
+```
+
+That local helper:
+
+1. runs the normal release flow
+2. waits for the GitHub release checksum artifact
+3. updates the sibling `homebrew-tap` checkout at `../homebrew-tap` by default
+4. commits the formula change
+5. pushes the tap repo
+
+If your tap repo lives somewhere else, set `MICO_HOMEBREW_TAP_DIR` before running the helper.

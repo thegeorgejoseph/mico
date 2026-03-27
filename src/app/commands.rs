@@ -6,6 +6,7 @@ use crate::{
         ports::{ConfigStore, DependencyInspector, StateStore, Updater},
         runtime::{LaunchMode, MicoRuntime},
     },
+    domain::model::WorkstreamRequest,
     infra::{
         config::{default_config, default_state, resolve_paths},
         deps::SystemDependencyInspector,
@@ -136,8 +137,9 @@ fn run_workstream_command(
     match command {
         WorkstreamCommand::Create {
             repo,
-            base,
             branch,
+            base,
+            existing,
             agent,
             open,
             attach,
@@ -156,8 +158,21 @@ fn run_workstream_command(
                 LaunchMode::Stay
             };
 
-            let workstream =
-                runtime.create_workstream_new(repo_id, &base, &branch, &agent, launch_mode)?;
+            let request = if existing {
+                WorkstreamRequest::Existing {
+                    branch: branch.clone(),
+                }
+            } else {
+                let base_branch = base.context(
+                    "provide `--base <branch>` to create a new branch, or pass `--existing` to use an existing branch",
+                )?;
+                WorkstreamRequest::New {
+                    branch: branch.clone(),
+                    base_branch,
+                }
+            };
+
+            let workstream = runtime.create_workstream(repo_id, request, &agent, launch_mode)?;
 
             println!(
                 "Created workstream `{}` for `{}`.",

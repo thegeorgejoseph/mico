@@ -46,9 +46,37 @@ pub struct Workstream {
     pub base_branch: String,
     pub branch: String,
     pub worktree_path: PathBuf,
+    #[serde(default)]
+    pub worktree_ownership: WorktreeOwnership,
     pub session_name: String,
     pub agent_preset: String,
     pub status: WorkstreamStatus,
+    #[serde(default)]
+    pub attention: WorkstreamAttention,
+    #[serde(default)]
+    pub pinned: bool,
+    #[serde(default)]
+    pub created_at_epoch_secs: u64,
+    #[serde(default)]
+    pub status_changed_at_epoch_secs: u64,
+    #[serde(default)]
+    pub last_opened_at_epoch_secs: Option<u64>,
+    #[serde(default)]
+    pub last_attached_at_epoch_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkstreamRequest {
+    New { branch: String, base_branch: String },
+    Existing { branch: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum WorkstreamAttention {
+    #[default]
+    None,
+    ReviewNext,
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,16 +86,25 @@ pub enum WorkstreamStatus {
     Stopped,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WorktreeCheckout {
     NewBranch { base_ref: String },
     ExistingBranch { start_ref: Option<String> },
+    ExistingCheckout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub enum WorktreeOwnership {
+    #[default]
+    Managed,
+    External,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreePlan {
     pub branch: String,
     pub worktree_path: PathBuf,
+    pub worktree_ownership: WorktreeOwnership,
     pub checkout: WorktreeCheckout,
 }
 

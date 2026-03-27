@@ -18,6 +18,7 @@ pub trait DependencyInspector {
 
 pub trait RepoService {
     fn discover_repo(&self, path: &Path, display_name: Option<&str>) -> anyhow::Result<RepoTarget>;
+    fn current_branch(&self, path: &Path) -> anyhow::Result<Option<String>>;
     fn list_branches(&self, repo: &RepoTarget) -> anyhow::Result<Vec<String>>;
     fn fetch_latest(&self, repo: &RepoTarget) -> anyhow::Result<()>;
     fn plan_new_worktree(
@@ -48,6 +49,8 @@ pub trait SessionBackend {
     fn attach(&self, session_name: &str) -> anyhow::Result<()>;
     fn stop(&self, session_name: &str) -> anyhow::Result<()>;
     fn attach_command(&self, session_name: &str) -> Vec<String>;
+    fn capture_recent_lines(&self, session_name: &str, lines: usize)
+    -> anyhow::Result<Vec<String>>;
 }
 
 pub trait TerminalFrontend {

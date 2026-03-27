@@ -1,6 +1,17 @@
 # mico
 
-Mission control for local CLI AI agents.
+```text
+                              
+ _ __ ___  _  ___ ___         
+| '_ ` _ \| |/ __/ _ \        
+| | | | | | | (_| (_) |       
+|_| |_| |_|_|\___\___/        
+                              
+```
+
+get shit done. opinionated. reliable. fast.
+
+Built with Rust, with safety and speed in mind.
 
 `mico` is a local-first Rust TUI for orchestrating parallel AI coding workstreams across multiple repositories. The core idea is simple:
 
@@ -9,13 +20,23 @@ Mission control for local CLI AI agents.
 - iTerm is the first terminal handoff target
 - `mico` provides the control plane
 
+## Install
+
+Homebrew is the fastest path:
+
+```sh
+brew tap thegeorgejoseph/tap
+brew install thegeorgejoseph/tap/mico
+mico
+```
+
 ## What It Does
 
 Today `mico` can:
 
 - track multiple repositories locally
 - fetch branches and create git-worktree-backed workstreams
-- launch `claude` or `codex` inside tmux-backed sessions
+- launch `claude`, `codex`, or a plain terminal inside tmux-backed sessions
 - open those sessions in iTerm or attach in the current terminal
 - survive closing `mico` itself because tmux owns the long-lived session
 - recover from a missing tmux session by recreating it in the saved worktree
@@ -73,22 +94,25 @@ Inside the dashboard:
 - `:` opens the command palette
 - `tab` switches between the repo and workstream panes
 - `j` / `k` move the current selection
-- `o` opens the selected workstream in iTerm
-- `a` attaches the selected workstream in the current terminal, and `Ctrl-b d` returns to `mico`
-- `r` recreates a missing tmux session in the existing worktree
+- `enter` or `o` opens the selected workstream in the current terminal, and `Ctrl-b d` returns to `mico`
+- `a` opens the selected workstream in a new iTerm tab
+- `t` opens triage actions for the selected workstream
+- `[` / `]` cycle workstream views, and `s` toggles attention-first vs recent sort
 - `x` stops the selected workstream without removing it
-- `Shift+D` removes the selected repo or workstream after confirmation
-- `q` quits
+- `Esc Esc` or `q q` quits the dashboard
+
+Use `:` for less-common actions like add repo, refresh repo, remove repo, resume workstream, and remove workstream.
 
 The command palette is where repo and workstream creation happens:
 
 - choose `Add repo` to track a repository from a path
 - choose `Create workstream` to use the selected repo
-- pick a base branch from a filterable list
 - choose whether to create a new branch or use an existing branch
-- pick the agent preset to launch in the tmux session
+- if you create a new branch, pick a base branch from a filterable list
+- if you use an existing branch, pick any matching local or remote branch directly
+- pick what launches in the tmux session: `terminal`, `claude`, `codex`, or another configured preset
 
-That means you can stay in the TUI for the whole “select repo -> select branch -> make worktree -> launch agent” flow.
+That means you can stay in the TUI for the whole “select repo -> select branch -> make worktree -> launch agent” flow, then flip between filtered workstream views without losing access to the same open, attach, resume, stop, and triage actions.
 
 ## CLI Back Door
 
@@ -104,6 +128,8 @@ Create and manage a workstream:
 
 ```sh
 mico workstream create --repo <repo> --base main --branch my-task --agent claude
+mico workstream create --repo <repo> --branch feature/existing-pr --existing --agent claude
+mico workstream create --repo <repo> --base main --branch debug-shell --agent terminal
 mico workstream list
 mico workstream open my-task
 mico workstream attach my-task
@@ -122,6 +148,8 @@ Notes:
 
 - `repo` can be a repo id prefix, display name, slug, or exact path
 - `workstream` can be a workstream id prefix, branch name, or tmux session name
+- `workstream create --branch <name> --existing` uses an existing local or remote branch as the workstream
+- `--agent terminal` creates a plain shell workstream instead of launching an AI agent
 - `workstream create --open` opens the new session in iTerm
 - `workstream create --attach` attaches the new session in your current terminal
 - worktrees are created under `~/.mico/worktrees/<repo-slug>/<branch-slug>`
@@ -142,6 +170,7 @@ make test         # run all workspace tests
 make ci           # run the local CI bundle: fmt-check, check, test
 make release      # bump patch version, verify, tag, and push from main
 make release BUMP=minor  # same flow, but bump the minor version
+make ship         # release mico and update the sibling homebrew tap checkout
 ```
 
 If you already use [`just`](https://github.com/casey/just), the repo also ships a matching `justfile`.

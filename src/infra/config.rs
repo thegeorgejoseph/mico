@@ -15,25 +15,33 @@ pub fn resolve_paths() -> anyhow::Result<AppPaths> {
     })
 }
 
+pub fn default_agent_presets() -> Vec<AgentPreset> {
+    vec![
+        AgentPreset {
+            name: "terminal".to_string(),
+            command: String::new(),
+        },
+        AgentPreset {
+            name: "claude".to_string(),
+            command: "claude".to_string(),
+        },
+        AgentPreset {
+            name: "codex".to_string(),
+            command: "codex".to_string(),
+        },
+    ]
+}
+
 pub fn default_config() -> AppConfig {
     AppConfig {
         github_repo: None,
-        agent_presets: vec![
-            AgentPreset {
-                name: "claude".to_string(),
-                command: "claude".to_string(),
-            },
-            AgentPreset {
-                name: "codex".to_string(),
-                command: "codex".to_string(),
-            },
-        ],
+        agent_presets: default_agent_presets(),
     }
 }
 
 pub fn default_state() -> StoredState {
     StoredState {
-        version: 1,
+        version: 2,
         repos: Vec::new(),
         workstreams: Vec::new(),
     }

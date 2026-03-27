@@ -70,17 +70,20 @@ pub enum RepoCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum WorkstreamCommand {
-    /// Create a new workstream from a base branch.
+    /// Create a workstream from either a new branch or an existing branch.
     Create {
         /// Repository id prefix, display name, slug, or path.
         #[arg(long)]
         repo: String,
-        /// Base branch to fetch and branch from.
-        #[arg(long)]
-        base: String,
-        /// Target branch for the new workstream.
+        /// Branch name to use for the workstream.
         #[arg(long)]
         branch: String,
+        /// Base branch to fetch and branch from when creating a new branch.
+        #[arg(long, conflicts_with = "existing")]
+        base: Option<String>,
+        /// Use an existing local or remote branch as the workstream branch.
+        #[arg(long)]
+        existing: bool,
         /// Agent preset to launch inside the tmux session.
         #[arg(long, default_value = "claude")]
         agent: String,

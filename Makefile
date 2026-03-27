@@ -26,3 +26,9 @@ ci: fmt-check check test
 
 release:
 	cargo run -p xtask -- release $(or $(BUMP),patch)
+
+ship:
+	cargo run -p xtask -- ship $(or $(BUMP),patch)
+
+update-tap:
+	cargo run -p xtask -- update-tap $(VERSION)

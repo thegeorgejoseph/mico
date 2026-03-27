@@ -4,6 +4,8 @@ use std::{
     env, fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, bail};
@@ -24,6 +26,18 @@ fn main() -> anyhow::Result<()> {
                 .context("usage: cargo run -p xtask -- release <patch|minor|major|VERSION>")?;
             release(&spec)
         }
+        "update-tap" => {
+            let version = args
+                .next()
+                .context("usage: cargo run -p xtask -- update-tap <VERSION>")?;
+            update_tap(&version)
+        }
+        "ship" => {
+            let spec = args
+                .next()
+                .context("usage: cargo run -p xtask -- ship <patch|minor|major|VERSION>")?;
+            ship(&spec)
+        }
         _ => {
             print_usage();
             bail!("unknown xtask command `{command}`")
@@ -34,6 +48,8 @@ fn main() -> anyhow::Result<()> {
 fn print_usage() {
     eprintln!("xtask commands:");
     eprintln!("  release <patch|minor|major|VERSION>");
+    eprintln!("  update-tap <VERSION>");
+    eprintln!("  ship <patch|minor|major|VERSION>");
 }
 
 fn release(spec: &str) -> anyhow::Result<()> {
@@ -66,6 +82,16 @@ fn release(spec: &str) -> anyhow::Result<()> {
     run_checked(&root, "git", &["push", "origin", "main", "--follow-tags"])?;
 
     Ok(())
+}
+
+fn ship(spec: &str) -> anyhow::Result<()> {
+    let root = project_root()?;
+    let cargo_manifest = root.join("Cargo.toml");
+    let current = load_version(&cargo_manifest)?;
+    let next = next_version(&current, spec)?;
+
+    release(spec)?;
+    update_tap(&next.to_string())
 }
 
 fn project_root() -> anyhow::Result<PathBuf> {
@@ -122,6 +148,27 @@ fn write_version(path: &Path, next: &Version) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn update_tap(version: &str) -> anyhow::Result<()> {
+    let root = project_root()?;
+    let tap_root = tap_root(&root)?;
+    ensure_clean_tree(&tap_root)?;
+
+    let repository = load_repository(&root.join("Cargo.toml"))?;
+    let formula_path = tap_root.join("Formula").join("mico.rb");
+    let checksum = fetch_release_checksum(&repository, version)?;
+
+    update_formula(&formula_path, version, &repository, &checksum)?;
+    run_checked(&tap_root, "git", &["add", "Formula/mico.rb"])?;
+    run_checked(
+        &tap_root,
+        "git",
+        &["commit", "-m", &format!("mico {version}")],
+    )?;
+    run_checked(&tap_root, "git", &["push"])?;
+
+    Ok(())
+}
+
 fn next_version(current: &Version, spec: &str) -> anyhow::Result<Version> {
     let mut next = current.clone();
 
@@ -140,6 +187,86 @@ fn next_version(current: &Version, spec: &str) -> anyhow::Result<Version> {
     }
 
     Ok(next)
+}
+
+fn tap_root(root: &Path) -> anyhow::Result<PathBuf> {
+    if let Ok(path) = env::var("MICO_HOMEBREW_TAP_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+
+    root.parent()
+        .map(|parent| parent.join("homebrew-tap"))
+        .context("project root did not have a parent directory")
+}
+
+fn load_repository(path: &Path) -> anyhow::Result<String> {
+    let raw = fs::read_to_string(path)?;
+    let document = raw.parse::<DocumentMut>()?;
+    document["package"]["repository"]
+        .as_str()
+        .map(str::to_string)
+        .context("package.repository was missing from Cargo.toml")
+}
+
+fn fetch_release_checksum(repository: &str, version: &str) -> anyhow::Result<String> {
+    let checksum_url = format!(
+        "{repository}/releases/download/v{version}/mico-{version}-aarch64-apple-darwin.tar.gz.sha256"
+    );
+
+    for attempt in 1..=24 {
+        match output_checked(Path::new("."), "curl", &["-fsSL", &checksum_url]) {
+            Ok(output) => {
+                let checksum = output
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                if checksum.is_empty() {
+                    bail!("release checksum file was empty for v{version}")
+                }
+                return Ok(checksum);
+            }
+            Err(error) if attempt < 24 => {
+                println!("waiting for release artifact checksum (attempt {attempt}/24): {error}");
+                thread::sleep(Duration::from_secs(5));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    bail!("release checksum did not become available for v{version}")
+}
+
+fn update_formula(
+    formula_path: &Path,
+    version: &str,
+    repository: &str,
+    checksum: &str,
+) -> anyhow::Result<()> {
+    let raw = fs::read_to_string(formula_path)?;
+    let release_url = format!(
+        "{repository}/releases/download/v{version}/mico-{version}-aarch64-apple-darwin.tar.gz"
+    );
+
+    let updated = raw
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("url ") {
+                format!("  url \"{release_url}\"")
+            } else if trimmed.starts_with("sha256 ") {
+                format!("  sha256 \"{checksum}\"")
+            } else if trimmed.starts_with("version ") {
+                format!("  version \"{version}\"")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    fs::write(formula_path, format!("{updated}\n"))?;
+    Ok(())
 }
 
 fn run_checked(root: &Path, program: &str, args: &[&str]) -> anyhow::Result<()> {

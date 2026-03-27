@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mico Premerge Review"
+  short_description: "Audit mico before merging to main"
+  default_prompt: "Use $mico-premerge-review to review this branch for security, Rust best practices, and merge readiness."

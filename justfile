@@ -29,3 +29,9 @@ ci: fmt-check check test
 
 release bump="patch":
     cargo run -p xtask -- release {{bump}}
+
+ship bump="patch":
+    cargo run -p xtask -- ship {{bump}}
+
+update-tap version:
+    cargo run -p xtask -- update-tap {{version}}

@@ -38,6 +38,24 @@ impl TmuxSessionBackend {
             .map(|output| output.status.success())
             .unwrap_or(false)
     }
+
+    fn output(args: &[&str]) -> anyhow::Result<String> {
+        let output = Command::new("tmux")
+            .args(args)
+            .output()
+            .with_context(|| format!("failed to run `tmux {}`", args.join(" ")))?;
+
+        if output.status.success() {
+            Ok(String::from_utf8_lossy(&output.stdout)
+                .trim_end()
+                .to_string())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() { stderr } else { stdout };
+            bail!("tmux {} failed: {detail}", args.join(" "))
+        }
+    }
 }
 
 impl SessionBackend for TmuxSessionBackend {
@@ -93,5 +111,26 @@ impl SessionBackend for TmuxSessionBackend {
             "-t".to_string(),
             session_name.to_string(),
         ]
+    }
+
+    fn capture_recent_lines(
+        &self,
+        session_name: &str,
+        lines: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let target = format!("{session_name}:0.0");
+        let output = Self::output(&["capture-pane", "-p", "-J", "-t", &target])?;
+
+        Ok(output
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.trim().is_empty())
+            .rev()
+            .take(lines)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(ToOwned::to_owned)
+            .collect())
     }
 }
