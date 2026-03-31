@@ -1,11 +1,8 @@
-use std::{
-    path::Path,
-    process::{Command, Stdio},
-};
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, bail};
 
-use crate::app::ports::SessionBackend;
+use crate::app::ports::{SessionBackend, SessionCreateRequest};
 
 #[derive(Debug, Default, Clone)]
 pub struct TmuxSessionBackend;
@@ -56,28 +53,102 @@ impl TmuxSessionBackend {
             bail!("tmux {} failed: {detail}", args.join(" "))
         }
     }
+
+    fn status_left(request: &SessionCreateRequest) -> String {
+        let session_suffix = if request.label.session_ordinal > 1 {
+            format!("  #{}", request.label.session_ordinal)
+        } else {
+            String::new()
+        };
+        format!(
+            " {}{}  {} ",
+            request.label.workstream_branch, request.label.agent_preset, session_suffix
+        )
+    }
+
+    fn configure_session(request: &SessionCreateRequest) -> anyhow::Result<()> {
+        let status_left = Self::status_left(request);
+        Self::status(&[
+            "set-option",
+            "-t",
+            &request.session_name,
+            "remain-on-exit",
+            "on",
+        ])?;
+        Self::status(&["set-option", "-t", &request.session_name, "status", "on"])?;
+        Self::status(&[
+            "set-option",
+            "-t",
+            &request.session_name,
+            "status-left",
+            &status_left,
+        ])?;
+        Self::status(&[
+            "set-option",
+            "-t",
+            &request.session_name,
+            "status-right",
+            " #{pane_current_path} | %H:%M ",
+        ])?;
+        Self::status(&[
+            "set-option",
+            "-t",
+            &request.session_name,
+            "allow-rename",
+            "off",
+        ])?;
+        Self::status(&[
+            "set-option",
+            "-t",
+            &request.session_name,
+            "automatic-rename",
+            "off",
+        ])?;
+        Self::status(&[
+            "rename-window",
+            "-t",
+            &format!("{}:0", request.session_name),
+            &request.label.workstream_branch,
+        ])
+    }
 }
 
 impl SessionBackend for TmuxSessionBackend {
-    fn create_session(
-        &self,
-        session_name: &str,
-        working_dir: &Path,
-        startup_command: &str,
-    ) -> anyhow::Result<()> {
-        if Self::session_exists(session_name) {
-            bail!("tmux session `{session_name}` already exists")
+    fn create_session(&self, request: &SessionCreateRequest) -> anyhow::Result<()> {
+        if Self::session_exists(&request.session_name) {
+            bail!("tmux session `{}` already exists", request.session_name)
         }
 
-        let working_dir = working_dir.to_string_lossy().to_string();
-        Self::status(&["new-session", "-d", "-s", session_name, "-c", &working_dir])?;
-        Self::status(&["set-option", "-t", session_name, "remain-on-exit", "on"])?;
+        let working_dir = request.working_dir.to_string_lossy().to_string();
+        Self::status(&[
+            "new-session",
+            "-d",
+            "-s",
+            &request.session_name,
+            "-c",
+            &working_dir,
+        ])?;
+        Self::configure_session(request)?;
 
-        if !startup_command.trim().is_empty() {
-            Self::status(&["send-keys", "-t", session_name, startup_command, "C-m"])?;
+        if !request.startup_command.trim().is_empty() {
+            Self::status(&[
+                "send-keys",
+                "-t",
+                &request.session_name,
+                &request.startup_command,
+                "C-m",
+            ])?;
         }
 
         Ok(())
+    }
+
+    fn sync_session(&self, request: &SessionCreateRequest) -> anyhow::Result<()> {
+        if !Self::session_exists(&request.session_name) {
+            bail!("tmux session `{}` does not exist", request.session_name)
+        }
+
+        Self::configure_session(request)
     }
 
     fn has_session(&self, session_name: &str) -> bool {

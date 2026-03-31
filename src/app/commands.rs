@@ -1,3 +1,5 @@
+use std::{thread, time::Duration};
+
 use anyhow::Context;
 
 use crate::{
@@ -6,7 +8,7 @@ use crate::{
         ports::{ConfigStore, DependencyInspector, StateStore, Updater},
         runtime::{LaunchMode, MicoRuntime},
     },
-    domain::model::WorkstreamRequest,
+    domain::model::{OperationEvent, OperationLevel, WorkstreamRequest},
     infra::{
         config::{default_config, default_state, resolve_paths},
         deps::SystemDependencyInspector,
@@ -32,6 +34,32 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Dashboard => {
             let runtime = MicoRuntime::new(paths, store, config, state)?;
             tui::run_dashboard(runtime)
+        }
+        Command::Status {
+            follow,
+            json,
+            lines,
+        } => {
+            let runtime = MicoRuntime::new(paths, store, config, state)?;
+            print_status_events(&runtime, lines, json)?;
+
+            if follow {
+                let mut printed = runtime.recent_operations(lines)?.len();
+                loop {
+                    thread::sleep(Duration::from_millis(800));
+                    let events = runtime.recent_operations(lines.saturating_add(printed))?;
+                    if events.len() <= printed {
+                        continue;
+                    }
+
+                    for event in events.iter().skip(printed) {
+                        print_status_event(event, json)?;
+                    }
+                    printed = events.len();
+                }
+            }
+
+            Ok(())
         }
         Command::Doctor { json } => {
             let report = SystemDependencyInspector::new(paths).doctor()?;
@@ -70,6 +98,46 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
             run_workstream_command(command, &mut runtime)
         }
         Command::Install => SystemUpdater::new().install_or_update(config.github_repo.as_deref()),
+    }
+}
+
+fn print_status_events(runtime: &MicoRuntime, lines: usize, json: bool) -> anyhow::Result<()> {
+    let events = runtime.recent_operations(lines)?;
+    if events.is_empty() {
+        println!("No operations logged yet.");
+        return Ok(());
+    }
+
+    for event in &events {
+        print_status_event(event, json)?;
+    }
+
+    Ok(())
+}
+
+fn print_status_event(event: &OperationEvent, json: bool) -> anyhow::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(event)?);
+    } else {
+        println!(
+            "{}  {:<9}  {:<18}  {:<22} {}",
+            event.timestamp_epoch_secs,
+            operation_level_label(&event.level),
+            event.scope,
+            event.action,
+            event.detail
+        );
+    }
+    Ok(())
+}
+
+fn operation_level_label(level: &OperationLevel) -> &'static str {
+    match level {
+        OperationLevel::Started => "started",
+        OperationLevel::Succeeded => "ok",
+        OperationLevel::Failed => "failed",
+        OperationLevel::Warning => "warning",
+        OperationLevel::Info => "info",
     }
 }
 

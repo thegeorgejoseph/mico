@@ -17,6 +17,18 @@ pub struct Cli {
 pub enum Command {
     /// Launch the TUI dashboard.
     Dashboard,
+    /// Stream or print recent mico operations.
+    Status {
+        /// Follow the operations log for new events.
+        #[arg(long)]
+        follow: bool,
+        /// Emit raw JSON lines.
+        #[arg(long)]
+        json: bool,
+        /// Number of recent events to print.
+        #[arg(long, default_value_t = 40)]
+        lines: usize,
+    },
     /// Print dependency and environment checks.
     Doctor {
         /// Emit the doctor report as JSON.

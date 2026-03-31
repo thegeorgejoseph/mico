@@ -66,6 +66,15 @@ impl GitCliRepoService {
         Self::output(Some(&repo.path), &["rev-parse", "--verify", reference]).is_ok()
     }
 
+    fn list_remotes(repo: &RepoTarget) -> anyhow::Result<Vec<String>> {
+        Ok(Self::output(Some(&repo.path), &["remote"])?
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect())
+    }
+
     fn slugify(input: &str) -> String {
         let mut slug = String::new();
         let mut last_dash = false;
@@ -91,13 +100,17 @@ impl GitCliRepoService {
         slug.trim_matches('-').to_string()
     }
 
-    fn ensure_new_branch_available(repo: &RepoTarget, branch: &str) -> anyhow::Result<()> {
+    fn ensure_new_branch_available(
+        repo: &RepoTarget,
+        branch: &str,
+        remote: &str,
+    ) -> anyhow::Result<()> {
         if Self::ref_exists(repo, &format!("refs/heads/{branch}")) {
             bail!("branch `{branch}` already exists locally")
         }
 
-        if Self::ref_exists(repo, &format!("refs/remotes/origin/{branch}")) {
-            bail!("branch `{branch}` already exists on origin")
+        if Self::ref_exists(repo, &format!("refs/remotes/{remote}/{branch}")) {
+            bail!("branch `{branch}` already exists on {remote}")
         }
 
         Ok(())
@@ -170,12 +183,15 @@ impl RepoService for GitCliRepoService {
     }
 
     fn list_branches(&self, repo: &RepoTarget) -> anyhow::Result<Vec<String>> {
+        let remote = self.default_remote(repo)?;
+        let remote_prefix = format!("refs/remotes/{remote}");
+        let short_prefix = format!("{remote}/");
         let raw = Self::output(
             Some(&repo.path),
             &[
                 "for-each-ref",
                 "--format=%(refname:short)",
-                "refs/remotes/origin",
+                &remote_prefix,
                 "refs/heads",
             ],
         )?;
@@ -183,16 +199,37 @@ impl RepoService for GitCliRepoService {
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty())
-            .filter(|line| *line != "origin/HEAD")
-            .map(|line| line.strip_prefix("origin/").unwrap_or(line).to_string())
+            .filter(|line| *line != format!("{remote}/HEAD"))
+            .map(|line| line.strip_prefix(&short_prefix).unwrap_or(line).to_string())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         Ok(branches)
     }
 
+    fn default_remote(&self, repo: &RepoTarget) -> anyhow::Result<String> {
+        let remotes = Self::list_remotes(repo)?;
+        if remotes.iter().any(|remote| remote == "origin") {
+            Ok("origin".to_string())
+        } else {
+            remotes
+                .into_iter()
+                .next()
+                .context("repository does not have a configured git remote")
+        }
+    }
+
     fn fetch_latest(&self, repo: &RepoTarget) -> anyhow::Result<()> {
-        Self::status(Some(&repo.path), &["fetch", "--prune", "origin"])
+        let remote = self.default_remote(repo)?;
+        if let Err(prune_error) = Self::status(Some(&repo.path), &["fetch", "--prune", &remote]) {
+            Self::status(Some(&repo.path), &["fetch", &remote]).with_context(|| {
+                format!(
+                    "git fetch with prune failed for remote `{remote}`: {}; retry without prune also failed",
+                    prune_error
+                )
+            })?;
+        }
+        Ok(())
     }
 
     fn plan_new_worktree(
@@ -202,14 +239,15 @@ impl RepoService for GitCliRepoService {
         branch: &str,
         base_branch: &str,
     ) -> anyhow::Result<WorktreePlan> {
-        Self::ensure_new_branch_available(repo, branch)?;
+        let remote = self.default_remote(repo)?;
+        Self::ensure_new_branch_available(repo, branch, &remote)?;
 
-        let base_ref = if Self::ref_exists(repo, &format!("refs/remotes/origin/{base_branch}")) {
-            format!("origin/{base_branch}")
+        let base_ref = if Self::ref_exists(repo, &format!("refs/remotes/{remote}/{base_branch}")) {
+            format!("{remote}/{base_branch}")
         } else if Self::ref_exists(repo, &format!("refs/heads/{base_branch}")) {
             base_branch.to_string()
         } else {
-            bail!("base branch `{base_branch}` does not exist locally or on origin")
+            bail!("base branch `{base_branch}` does not exist locally or on {remote}")
         };
 
         let branch_slug = Self::slugify(branch);
@@ -238,11 +276,12 @@ impl RepoService for GitCliRepoService {
         worktrees_root: &Path,
         branch: &str,
     ) -> anyhow::Result<WorktreePlan> {
+        let remote = self.default_remote(repo)?;
         let local_exists = Self::ref_exists(repo, &format!("refs/heads/{branch}"));
-        let remote_exists = Self::ref_exists(repo, &format!("refs/remotes/origin/{branch}"));
+        let remote_exists = Self::ref_exists(repo, &format!("refs/remotes/{remote}/{branch}"));
 
         if !local_exists && !remote_exists {
-            bail!("branch `{branch}` does not exist locally or on origin")
+            bail!("branch `{branch}` does not exist locally or on {remote}")
         }
 
         if local_exists && let Some(existing_path) = Self::checked_out_branch_path(repo, branch) {
@@ -270,7 +309,7 @@ impl RepoService for GitCliRepoService {
             WorktreeCheckout::ExistingBranch { start_ref: None }
         } else {
             WorktreeCheckout::ExistingBranch {
-                start_ref: Some(format!("origin/{branch}")),
+                start_ref: Some(format!("{remote}/{branch}")),
             }
         };
 
@@ -311,6 +350,26 @@ impl RepoService for GitCliRepoService {
             }
             WorktreeCheckout::ExistingCheckout => Ok(()),
         }
+    }
+
+    fn configure_push_target(
+        &self,
+        worktree_path: &Path,
+        branch: &str,
+        remote: &str,
+    ) -> anyhow::Result<()> {
+        Self::status(
+            Some(worktree_path),
+            &["config", &format!("branch.{branch}.remote"), remote],
+        )?;
+        Self::status(
+            Some(worktree_path),
+            &[
+                "config",
+                &format!("branch.{branch}.merge"),
+                &format!("refs/heads/{branch}"),
+            ],
+        )
     }
 
     fn remove_worktree(&self, repo: &RepoTarget, worktree_path: &Path) -> anyhow::Result<()> {
@@ -465,6 +524,42 @@ mod tests {
 
         assert_eq!(head, "remote-only");
         assert_eq!(branches.trim(), "* remote-only");
+        Ok(())
+    }
+
+    #[test]
+    fn configure_push_target_allows_plain_git_push_for_new_branch_worktrees() -> anyhow::Result<()>
+    {
+        let (_temp, repo, _seed_path, worktrees_root, default_branch) = init_repo_fixture()?;
+        let service = GitCliRepoService::new();
+
+        let plan =
+            service.plan_new_worktree(&repo, &worktrees_root, "feature-push", &default_branch)?;
+        service.create_worktree(&repo, &plan)?;
+        service.configure_push_target(&plan.worktree_path, "feature-push", "origin")?;
+
+        let output = Command::new("git")
+            .current_dir(&plan.worktree_path)
+            .arg("push")
+            .output()?;
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            git(
+                &plan.worktree_path,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}"
+                ]
+            )?,
+            "origin/feature-push"
+        );
         Ok(())
     }
 

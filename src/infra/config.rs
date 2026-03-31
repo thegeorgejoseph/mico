@@ -10,6 +10,7 @@ pub fn resolve_paths() -> anyhow::Result<AppPaths> {
     Ok(AppPaths {
         config_path: root.join("config.json"),
         state_path: root.join("state.json"),
+        operations_log_path: root.join("operations.jsonl"),
         worktrees_root: root.join("worktrees"),
         root,
     })
@@ -20,14 +21,22 @@ pub fn default_agent_presets() -> Vec<AgentPreset> {
         AgentPreset {
             name: "terminal".to_string(),
             command: String::new(),
+            one_off_command: None,
         },
         AgentPreset {
             name: "claude".to_string(),
             command: "claude".to_string(),
+            one_off_command: Some("claude -p {prompt}".to_string()),
         },
         AgentPreset {
             name: "codex".to_string(),
             command: "codex".to_string(),
+            one_off_command: Some("codex exec {prompt}".to_string()),
+        },
+        AgentPreset {
+            name: "opencode".to_string(),
+            command: "opencode".to_string(),
+            one_off_command: Some("opencode run {prompt}".to_string()),
         },
     ]
 }
@@ -41,7 +50,7 @@ pub fn default_config() -> AppConfig {
 
 pub fn default_state() -> StoredState {
     StoredState {
-        version: 2,
+        version: 3,
         repos: Vec::new(),
         workstreams: Vec::new(),
     }

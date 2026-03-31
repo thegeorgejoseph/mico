@@ -1,6 +1,42 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use crate::domain::model::{AppConfig, DoctorReport, RepoTarget, StoredState, WorktreePlan};
+use crate::domain::model::{
+    AppConfig, DoctorReport, OperationEvent, RepoTarget, StoredState, WorktreePlan,
+};
+
+pub trait RuntimeStore: ConfigStore + StateStore {}
+
+impl<T> RuntimeStore for T where T: ConfigStore + StateStore {}
+
+#[derive(Debug, Clone)]
+pub struct SessionCreateRequest {
+    pub session_name: String,
+    pub working_dir: PathBuf,
+    pub startup_command: String,
+    pub label: SessionLabel,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionLabel {
+    pub repo_name: String,
+    pub workstream_branch: String,
+    pub agent_preset: String,
+    pub session_ordinal: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentOneOffRequest {
+    pub preset_name: String,
+    pub command_template: String,
+    pub prompt: String,
+    pub working_dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentOneOffResult {
+    pub stdout: String,
+    pub stderr: String,
+}
 
 pub trait ConfigStore {
     fn load_or_create_config(&self, default: AppConfig) -> anyhow::Result<AppConfig>;
@@ -20,6 +56,7 @@ pub trait RepoService {
     fn discover_repo(&self, path: &Path, display_name: Option<&str>) -> anyhow::Result<RepoTarget>;
     fn current_branch(&self, path: &Path) -> anyhow::Result<Option<String>>;
     fn list_branches(&self, repo: &RepoTarget) -> anyhow::Result<Vec<String>>;
+    fn default_remote(&self, repo: &RepoTarget) -> anyhow::Result<String>;
     fn fetch_latest(&self, repo: &RepoTarget) -> anyhow::Result<()>;
     fn plan_new_worktree(
         &self,
@@ -35,16 +72,18 @@ pub trait RepoService {
         branch: &str,
     ) -> anyhow::Result<WorktreePlan>;
     fn create_worktree(&self, repo: &RepoTarget, plan: &WorktreePlan) -> anyhow::Result<()>;
+    fn configure_push_target(
+        &self,
+        worktree_path: &Path,
+        branch: &str,
+        remote: &str,
+    ) -> anyhow::Result<()>;
     fn remove_worktree(&self, repo: &RepoTarget, worktree_path: &Path) -> anyhow::Result<()>;
 }
 
 pub trait SessionBackend {
-    fn create_session(
-        &self,
-        session_name: &str,
-        working_dir: &Path,
-        startup_command: &str,
-    ) -> anyhow::Result<()>;
+    fn create_session(&self, request: &SessionCreateRequest) -> anyhow::Result<()>;
+    fn sync_session(&self, request: &SessionCreateRequest) -> anyhow::Result<()>;
     fn has_session(&self, session_name: &str) -> bool;
     fn attach(&self, session_name: &str) -> anyhow::Result<()>;
     fn stop(&self, session_name: &str) -> anyhow::Result<()>;
@@ -55,6 +94,15 @@ pub trait SessionBackend {
 
 pub trait TerminalFrontend {
     fn open_session(&self, session_name: &str, attach_command: &[String]) -> anyhow::Result<()>;
+}
+
+pub trait CommandRunner {
+    fn run_agent_one_off(&self, request: &AgentOneOffRequest) -> anyhow::Result<AgentOneOffResult>;
+}
+
+pub trait OperationLog {
+    fn record(&self, event: &OperationEvent) -> anyhow::Result<()>;
+    fn recent(&self, limit: usize) -> anyhow::Result<Vec<OperationEvent>>;
 }
 
 pub trait Updater {

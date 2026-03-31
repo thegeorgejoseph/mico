@@ -3,5 +3,7 @@ pub mod deps;
 pub mod git;
 pub mod iterm;
 pub mod json_store;
+pub mod operations;
 pub mod platform;
+pub mod process;
 pub mod tmux;

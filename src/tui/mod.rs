@@ -23,7 +23,9 @@ use uuid::Uuid;
 
 use crate::{
     app::runtime::{LaunchMode, MicoRuntime},
-    domain::model::{Workstream, WorkstreamAttention, WorkstreamRequest, WorkstreamStatus},
+    domain::model::{
+        Workstream, WorkstreamAttention, WorkstreamRequest, WorkstreamSession, WorkstreamStatus,
+    },
 };
 
 const MICO_BANNER: [&str; 4] = [
@@ -42,6 +44,7 @@ const WARNING_AMBER: Color = Color::Rgb(255, 193, 94);
 const ERROR_RED: Color = Color::Rgb(255, 107, 107);
 const INFO_BLUE: Color = Color::Rgb(104, 180, 255);
 const MUTED_TEXT: Color = Color::Rgb(145, 152, 168);
+const LIVE_OUTPUT: Color = Color::Rgb(255, 244, 161);
 
 pub fn run_dashboard(runtime: MicoRuntime) -> anyhow::Result<()> {
     let mut terminal = initialize_terminal()?;
@@ -68,9 +71,11 @@ fn dashboard_loop(
             match app.handle_key(key)? {
                 DashboardAction::None => {}
                 DashboardAction::Quit => return Ok(()),
-                DashboardAction::Attach(workstream_id) => {
+                DashboardAction::Attach(workstream_id, session_id) => {
                     suspend_terminal(terminal)?;
-                    let result = app.runtime.attach_workstream(workstream_id);
+                    let result = app
+                        .runtime
+                        .attach_workstream_session(workstream_id, session_id);
                     resume_terminal(terminal)?;
                     app.set_status_from_result(
                         result.map(|_| "Detached from workstream.".to_string()),
@@ -128,7 +133,7 @@ impl FocusPane {
 enum DashboardAction {
     None,
     Quit,
-    Attach(Uuid),
+    Attach(Uuid, Uuid),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +232,8 @@ enum QuitKey {
 enum PaletteCommand {
     AddRepo,
     CreateWorkstream,
+    LaunchWorkstreamSession,
+    RunWorkstreamOneOff,
     OpenInVscode,
     RefreshRepo,
     RemoveRepo,
@@ -245,7 +252,7 @@ struct PaletteEntry {
     detail: &'static str,
 }
 
-const PALETTE_ENTRIES: [PaletteEntry; 11] = [
+const PALETTE_ENTRIES: [PaletteEntry; 13] = [
     PaletteEntry {
         command: PaletteCommand::AddRepo,
         title: "Add repo",
@@ -255,6 +262,16 @@ const PALETTE_ENTRIES: [PaletteEntry; 11] = [
         command: PaletteCommand::CreateWorkstream,
         title: "Create workstream",
         detail: "Use the selected repo to create a new or existing branch worktree.",
+    },
+    PaletteEntry {
+        command: PaletteCommand::LaunchWorkstreamSession,
+        title: "Launch another session",
+        detail: "Start an additional claude, codex, opencode, or terminal session in the selected workstream.",
+    },
+    PaletteEntry {
+        command: PaletteCommand::RunWorkstreamOneOff,
+        title: "Run one-off agent command",
+        detail: "Open a drawer for a non-interactive agent run in the selected workstream.",
     },
     PaletteEntry {
         command: PaletteCommand::OpenInVscode,
@@ -314,6 +331,9 @@ enum Modal {
     AddRepo(AddRepoModal),
     Confirm(ConfirmModal),
     CreateWorkstream(CreateWorkstreamFlow),
+    LaunchSession(LaunchSessionModal),
+    OneOff(OneOffModal),
+    SessionPicker(SessionPickerModal),
     WorkstreamFilter(WorkstreamFilterModal),
     Triage(TriageModal),
 }
@@ -334,6 +354,31 @@ struct ConfirmModal {
     title: String,
     body: String,
     action: ConfirmAction,
+}
+
+#[derive(Debug, Clone)]
+struct LaunchSessionModal {
+    workstream_id: Uuid,
+    branch: String,
+    launch_mode: LaunchMode,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct OneOffModal {
+    workstream_id: Uuid,
+    branch: String,
+    prompt: String,
+    output: Option<String>,
+    selected: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SessionPickerModal {
+    workstream_id: Uuid,
+    branch: String,
+    launch_mode: LaunchMode,
+    selected: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -684,7 +729,21 @@ impl DashboardApp {
                         Line::from(header),
                         line_from_stat_pairs(&[
                             ("repo".to_string(), repo_name.to_string()),
-                            ("agent".to_string(), workstream.agent_preset.clone()),
+                            (
+                                "agent".to_string(),
+                                workstream
+                                    .preferred_session()
+                                    .map(|session| session.agent_preset.clone())
+                                    .unwrap_or_else(|| workstream.agent_preset.clone()),
+                            ),
+                            (
+                                "sessions".to_string(),
+                                format!(
+                                    "{}/{} live",
+                                    workstream.running_session_count(),
+                                    workstream.session_count()
+                                ),
+                            ),
                             (
                                 "created".to_string(),
                                 elapsed_label(workstream.created_at_epoch_secs),
@@ -704,21 +763,38 @@ impl DashboardApp {
                     ];
 
                     if selected_workstream_id == Some(workstream.id) {
-                        let hint = match workstream.status {
-                            WorkstreamStatus::Running => line_from_pairs(&[
+                        let hint = match (workstream.status.clone(), workstream.session_count()) {
+                            (WorkstreamStatus::Running, 0 | 1) => line_from_pairs(&[
                                 ("Enter/o", "open here"),
                                 ("a", "new tab"),
+                                ("n", "new session"),
                                 ("t", "triage"),
                                 ("x", "stop"),
                             ]),
-                            WorkstreamStatus::Stopped => line_from_pairs(&[
+                            (WorkstreamStatus::Running, _) => line_from_pairs(&[
+                                ("Enter/o", "pick session"),
+                                ("a", "pick new tab"),
+                                ("n", "new session"),
+                                ("t", "triage"),
+                                ("x", "stop"),
+                            ]),
+                            (WorkstreamStatus::Stopped, 0 | 1) => line_from_pairs(&[
                                 ("Enter/o", "resume here"),
                                 ("a", "resume in new tab"),
+                                ("n", "new session"),
+                                ("t", "triage"),
+                            ]),
+                            (WorkstreamStatus::Stopped, _) => line_from_pairs(&[
+                                ("Enter/o", "pick session"),
+                                ("a", "pick new tab"),
+                                ("n", "new session"),
                                 ("t", "triage"),
                             ]),
                         };
                         lines.push(hint);
                     }
+
+                    lines.push(Line::from(""));
 
                     ListItem::new(lines)
                 })
@@ -787,10 +863,16 @@ impl DashboardApp {
         let selected_line = self
             .selected_workstream()
             .map(|workstream| {
+                let session_label = workstream
+                    .preferred_session()
+                    .map(|session| session.agent_preset.clone())
+                    .unwrap_or_else(|| workstream.agent_preset.clone());
                 format!(
-                    "selected {}   state {}   last touch {}",
+                    "selected {}   session {}   live {}/{}   last touch {}",
                     workstream.branch,
-                    workstream_state_label(workstream),
+                    session_label,
+                    workstream.running_session_count(),
+                    workstream.session_count(),
                     option_elapsed_label(
                         workstream
                             .last_attached_at_epoch_secs
@@ -841,13 +923,13 @@ impl DashboardApp {
 
         let output_lines = if self.recent_output_lines.is_empty() {
             vec![Line::styled(
-                "out waiting for pane output",
-                Style::default().fg(MUTED_TEXT),
+                "live waiting for pane output",
+                Style::default().fg(LIVE_OUTPUT),
             )]
         } else {
             self.recent_output_lines
                 .iter()
-                .map(|line| Line::styled(format!("out {line}"), Style::default().fg(MUTED_TEXT)))
+                .map(|line| Line::styled(format!("live {line}"), Style::default().fg(LIVE_OUTPUT)))
                 .collect::<Vec<_>>()
         };
         frame.render_widget(
@@ -960,10 +1042,15 @@ impl DashboardApp {
             )
         });
         let selected_workstream = self.selected_workstream().map(|workstream| {
+            let session_summary = workstream
+                .preferred_session()
+                .map(|session| format!("{} ({})", session.agent_preset, session.session_name))
+                .unwrap_or_else(|| "no session".to_string());
             format!(
-                "selected workstream: {}  -> {}",
+                "selected workstream: {}  -> {}  [{}]",
                 workstream.branch,
-                workstream.worktree_path.display()
+                workstream.worktree_path.display(),
+                session_summary
             )
         });
         let status = self.status.clone().unwrap_or(StatusMessage {
@@ -980,6 +1067,8 @@ impl DashboardApp {
                 ("Enter", "open here"),
                 ("o", "open here"),
                 ("a", "open new tab"),
+                ("n", "new session"),
+                ("!", "one-off"),
                 ("v", "open in code"),
                 ("/", "filter"),
                 ("t", "triage"),
@@ -1090,6 +1179,9 @@ impl DashboardApp {
             Modal::AddRepo(model) => self.render_add_repo_modal(frame, model),
             Modal::Confirm(model) => self.render_confirm_modal(frame, model),
             Modal::CreateWorkstream(model) => self.render_create_workstream_modal(frame, model),
+            Modal::LaunchSession(model) => self.render_launch_session_modal(frame, model),
+            Modal::OneOff(model) => self.render_one_off_modal(frame, model),
+            Modal::SessionPicker(model) => self.render_session_picker_modal(frame, model),
             Modal::WorkstreamFilter(model) => self.render_workstream_filter_modal(frame, model),
             Modal::Triage(model) => self.render_triage_modal(frame, model),
         }
@@ -1213,6 +1305,150 @@ impl DashboardApp {
 
         frame.render_widget(help, layout[0]);
         frame.render_stateful_widget(list, layout[1], &mut state);
+    }
+
+    fn render_session_picker_modal(&self, frame: &mut Frame<'_>, modal: &SessionPickerModal) {
+        let area = centered_rect(66, 42, frame.area());
+        frame.render_widget(Clear, area);
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(5), Constraint::Min(8)])
+            .split(area);
+
+        let help = Paragraph::new(Text::from(vec![
+            Line::from(format!("Choose a session for `{}`", modal.branch)),
+            line_from_pairs(&[
+                ("↑↓", "move"),
+                ("Enter", "open session"),
+                ("n", "new session"),
+                ("Esc", "cancel"),
+            ]),
+        ]))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("Sessions"));
+
+        let sessions = self
+            .runtime
+            .workstream_sessions(modal.workstream_id)
+            .unwrap_or_default();
+        let items = sessions
+            .iter()
+            .map(session_picker_item)
+            .collect::<Vec<ListItem<'_>>>();
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(modal.selected.min(items.len().saturating_sub(1))));
+        }
+
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title("Available"))
+            .highlight_style(
+                Style::default()
+                    .bg(PANEL_HIGHLIGHT)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol(">> ");
+
+        frame.render_widget(help, layout[0]);
+        frame.render_stateful_widget(list, layout[1], &mut state);
+    }
+
+    fn render_launch_session_modal(&self, frame: &mut Frame<'_>, modal: &LaunchSessionModal) {
+        let area = centered_rect(58, 30, frame.area());
+        frame.render_widget(Clear, area);
+        let help = Paragraph::new(Text::from(vec![
+            Line::from(format!("Launch another session for `{}`", modal.branch)),
+            line_from_pairs(&[("↑↓", "move"), ("Enter", "launch"), ("Esc", "cancel")]),
+        ]))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("New Session"));
+
+        let presets = self
+            .runtime
+            .config
+            .agent_presets
+            .iter()
+            .map(|preset| {
+                if preset.command.trim().is_empty() {
+                    format!("{} -> shell", preset.name)
+                } else {
+                    format!("{} -> {}", preset.name, preset.command)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut state = ListState::default();
+        if !presets.is_empty() {
+            state.select(Some(modal.selected.min(presets.len().saturating_sub(1))));
+        }
+
+        let list = List::new(
+            presets
+                .into_iter()
+                .map(ListItem::new)
+                .collect::<Vec<ListItem<'_>>>(),
+        )
+        .block(Block::default().borders(Borders::ALL).title("Agents"))
+        .highlight_style(
+            Style::default()
+                .bg(PANEL_HIGHLIGHT)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol(">> ");
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(5), Constraint::Min(8)])
+            .split(area);
+        frame.render_widget(help, layout[0]);
+        frame.render_stateful_widget(list, layout[1], &mut state);
+    }
+
+    fn render_one_off_modal(&self, frame: &mut Frame<'_>, modal: &OneOffModal) {
+        let area = centered_rect(76, 60, frame.area());
+        frame.render_widget(Clear, area);
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(5),
+                Constraint::Length(3),
+                Constraint::Length(4),
+                Constraint::Min(10),
+            ])
+            .split(area);
+
+        let help = Paragraph::new(Text::from(vec![
+            Line::from(format!("One-off agent run in `{}`", modal.branch)),
+            line_from_pairs(&[
+                ("↑↓", "change agent"),
+                ("Type", "edit prompt"),
+                ("Enter", "run"),
+                ("Esc", "close"),
+            ]),
+        ]))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("One-Off"));
+
+        let presets = one_off_agent_names(&self.runtime);
+        let selected_agent = presets
+            .get(modal.selected)
+            .cloned()
+            .unwrap_or_else(|| "n/a".to_string());
+        let agent = Paragraph::new(selected_agent)
+            .block(Block::default().borders(Borders::ALL).title("Agent"));
+        let prompt = Paragraph::new(modal.prompt.clone())
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::ALL).title("Prompt"));
+        let output = Paragraph::new(modal.output.clone().unwrap_or_else(|| {
+            "Run a one-off command and the response will land here.".to_string()
+        }))
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title("Output"));
+
+        frame.render_widget(help, layout[0]);
+        frame.render_widget(agent, layout[1]);
+        frame.render_widget(prompt, layout[2]);
+        frame.render_widget(output, layout[3]);
     }
 
     fn render_create_workstream_modal(&self, frame: &mut Frame<'_>, flow: &CreateWorkstreamFlow) {
@@ -1381,9 +1617,7 @@ impl DashboardApp {
             KeyCode::Char('q') => self.confirm_quit(QuitKey::Q, "q"),
             KeyCode::Enter => match self.focus {
                 FocusPane::Repos => self.activate_palette_command(PaletteCommand::CreateWorkstream),
-                FocusPane::Workstreams => {
-                    self.activate_palette_command(PaletteCommand::OpenWorkstream)
-                }
+                FocusPane::Workstreams => self.open_or_pick_selected_workstream(LaunchMode::Attach),
             },
             KeyCode::Tab => {
                 self.pending_quit = None;
@@ -1457,7 +1691,7 @@ impl DashboardApp {
             }
             KeyCode::Char('o') => {
                 if let Some(id) = self.selected_workstream_id() {
-                    return Ok(DashboardAction::Attach(id));
+                    return self.open_or_pick_workstream(id, LaunchMode::Attach);
                 } else {
                     self.set_status("Select a workstream first.".to_string());
                 }
@@ -1465,17 +1699,25 @@ impl DashboardApp {
             }
             KeyCode::Char('a') => {
                 if let Some(id) = self.selected_workstream_id() {
-                    let result = self
-                        .runtime
-                        .open_workstream(id)
-                        .map(|_| "Opened workstream in a new tab.".to_string());
-                    self.set_status_from_result(result);
-                    self.select_workstream_by_id(id);
-                    Ok(DashboardAction::None)
+                    self.open_or_pick_workstream(id, LaunchMode::Open)
                 } else {
                     self.set_status("Select a workstream first.".to_string());
                     Ok(DashboardAction::None)
                 }
+            }
+            KeyCode::Char('n') if self.focus == FocusPane::Workstreams => {
+                let Some(workstream_id) = self.selected_workstream_id() else {
+                    self.set_status("Select a workstream first.".to_string());
+                    return Ok(DashboardAction::None);
+                };
+                self.open_launch_session_modal(workstream_id, LaunchMode::Stay)
+            }
+            KeyCode::Char('!') if self.focus == FocusPane::Workstreams => {
+                let Some(workstream_id) = self.selected_workstream_id() else {
+                    self.set_status("Select a workstream first.".to_string());
+                    return Ok(DashboardAction::None);
+                };
+                self.open_one_off_modal(workstream_id)
             }
             KeyCode::Char('v') => {
                 let result = match self.focus {
@@ -1648,10 +1890,176 @@ impl DashboardApp {
                     let keep_open = self.handle_create_workstream_key(&mut flow, key)?;
                     if keep_open {
                         self.modal = Some(Modal::CreateWorkstream(flow));
+                    } else {
+                        self.modal = None;
                     }
                     Ok(DashboardAction::None)
                 }
             },
+            Modal::LaunchSession(mut model) => {
+                let len = self.runtime.config.agent_presets.len();
+                match key.code {
+                    KeyCode::Esc => self.modal = None,
+                    KeyCode::Down => {
+                        if len > 0 {
+                            model.selected = (model.selected + 1).min(len.saturating_sub(1));
+                        }
+                        self.modal = Some(Modal::LaunchSession(model));
+                    }
+                    KeyCode::Up => {
+                        model.selected = model.selected.saturating_sub(1);
+                        self.modal = Some(Modal::LaunchSession(model));
+                    }
+                    KeyCode::Enter => {
+                        let Some(agent) = self
+                            .runtime
+                            .config
+                            .agent_presets
+                            .get(model.selected)
+                            .map(|preset| preset.name.clone())
+                        else {
+                            self.set_status("No agent presets configured.".to_string());
+                            self.modal = Some(Modal::LaunchSession(model));
+                            return Ok(DashboardAction::None);
+                        };
+
+                        self.modal = None;
+                        let runtime_launch_mode = if matches!(model.launch_mode, LaunchMode::Attach)
+                        {
+                            LaunchMode::Stay
+                        } else {
+                            model.launch_mode
+                        };
+                        let result = self.runtime.create_workstream_session(
+                            model.workstream_id,
+                            &agent,
+                            runtime_launch_mode,
+                        );
+                        match result {
+                            Ok(session) => {
+                                self.select_workstream_by_id(model.workstream_id);
+                                self.set_status(format!(
+                                    "Launched {} session `{}`.",
+                                    session.agent_preset, session.session_name
+                                ));
+                                if matches!(model.launch_mode, LaunchMode::Attach) {
+                                    return Ok(DashboardAction::Attach(
+                                        model.workstream_id,
+                                        session.id,
+                                    ));
+                                }
+                            }
+                            Err(error) => self.set_status(error.to_string()),
+                        }
+                    }
+                    _ => {
+                        self.modal = Some(Modal::LaunchSession(model));
+                    }
+                }
+                Ok(DashboardAction::None)
+            }
+            Modal::OneOff(mut model) => {
+                let presets = one_off_agent_names(&self.runtime);
+                match key.code {
+                    KeyCode::Esc => self.modal = None,
+                    KeyCode::Backspace => {
+                        model.prompt.pop();
+                        self.modal = Some(Modal::OneOff(model));
+                    }
+                    KeyCode::Down => {
+                        if !presets.is_empty() {
+                            model.selected =
+                                (model.selected + 1).min(presets.len().saturating_sub(1));
+                        }
+                        self.modal = Some(Modal::OneOff(model));
+                    }
+                    KeyCode::Up => {
+                        model.selected = model.selected.saturating_sub(1);
+                        self.modal = Some(Modal::OneOff(model));
+                    }
+                    KeyCode::Enter => {
+                        let Some(agent) = presets.get(model.selected) else {
+                            self.set_status("No one-off agents are configured.".to_string());
+                            self.modal = Some(Modal::OneOff(model));
+                            return Ok(DashboardAction::None);
+                        };
+                        if model.prompt.trim().is_empty() {
+                            self.set_status("Type a one-off prompt first.".to_string());
+                            self.modal = Some(Modal::OneOff(model));
+                            return Ok(DashboardAction::None);
+                        }
+                        match self.runtime.run_workstream_one_off(
+                            model.workstream_id,
+                            agent,
+                            model.prompt.trim(),
+                        ) {
+                            Ok(output) => {
+                                model.output = Some(output);
+                                self.modal = Some(Modal::OneOff(model));
+                            }
+                            Err(error) => {
+                                model.output = Some(error.to_string());
+                                self.modal = Some(Modal::OneOff(model));
+                            }
+                        }
+                    }
+                    KeyCode::Char(ch) => {
+                        model.prompt.push(ch);
+                        self.modal = Some(Modal::OneOff(model));
+                    }
+                    _ => self.modal = Some(Modal::OneOff(model)),
+                }
+                Ok(DashboardAction::None)
+            }
+            Modal::SessionPicker(mut model) => {
+                let sessions = self
+                    .runtime
+                    .workstream_sessions(model.workstream_id)
+                    .unwrap_or_default();
+                match key.code {
+                    KeyCode::Esc => self.modal = None,
+                    KeyCode::Char('n') => {
+                        self.modal = None;
+                        return self
+                            .open_launch_session_modal(model.workstream_id, model.launch_mode);
+                    }
+                    KeyCode::Down => {
+                        if !sessions.is_empty() {
+                            model.selected =
+                                (model.selected + 1).min(sessions.len().saturating_sub(1));
+                        }
+                        self.modal = Some(Modal::SessionPicker(model));
+                    }
+                    KeyCode::Up => {
+                        model.selected = model.selected.saturating_sub(1);
+                        self.modal = Some(Modal::SessionPicker(model));
+                    }
+                    KeyCode::Enter => {
+                        let Some(session) = sessions.get(model.selected).cloned() else {
+                            self.set_status("No sessions are available.".to_string());
+                            self.modal = Some(Modal::SessionPicker(model));
+                            return Ok(DashboardAction::None);
+                        };
+
+                        self.modal = None;
+                        self.runtime
+                            .set_preferred_session(model.workstream_id, session.id)?;
+                        self.select_workstream_by_id(model.workstream_id);
+
+                        if matches!(model.launch_mode, LaunchMode::Attach) {
+                            return Ok(DashboardAction::Attach(model.workstream_id, session.id));
+                        }
+
+                        let result = self
+                            .runtime
+                            .open_workstream_session(model.workstream_id, session.id)
+                            .map(|_| format!("Opened {} in a new tab.", session.agent_preset));
+                        self.set_status_from_result(result);
+                    }
+                    _ => self.modal = Some(Modal::SessionPicker(model)),
+                }
+                Ok(DashboardAction::None)
+            }
             Modal::WorkstreamFilter(mut model) => {
                 match key.code {
                     KeyCode::Esc => {
@@ -1934,6 +2342,20 @@ impl DashboardApp {
                     Err(error) => self.set_status(error.to_string()),
                 }
             }
+            PaletteCommand::LaunchWorkstreamSession => {
+                let Some(workstream_id) = self.selected_workstream_id() else {
+                    self.set_status("Select a workstream first.".to_string());
+                    return Ok(DashboardAction::None);
+                };
+                return self.open_launch_session_modal(workstream_id, LaunchMode::Stay);
+            }
+            PaletteCommand::RunWorkstreamOneOff => {
+                let Some(workstream_id) = self.selected_workstream_id() else {
+                    self.set_status("Select a workstream first.".to_string());
+                    return Ok(DashboardAction::None);
+                };
+                return self.open_one_off_modal(workstream_id);
+            }
             PaletteCommand::OpenInVscode => {
                 let result = match self.focus {
                     FocusPane::Repos => self
@@ -1982,18 +2404,14 @@ impl DashboardApp {
                     self.set_status("Select a workstream first.".to_string());
                     return Ok(DashboardAction::None);
                 };
-                return Ok(DashboardAction::Attach(workstream_id));
+                return self.open_or_pick_workstream(workstream_id, LaunchMode::Attach);
             }
             PaletteCommand::AttachWorkstream => {
                 let Some(workstream_id) = self.selected_workstream_id() else {
                     self.set_status("Select a workstream first.".to_string());
                     return Ok(DashboardAction::None);
                 };
-                let result = self
-                    .runtime
-                    .open_workstream(workstream_id)
-                    .map(|_| "Opened workstream in a new tab.".to_string());
-                self.set_status_from_result(result);
+                return self.open_or_pick_workstream(workstream_id, LaunchMode::Open);
             }
             PaletteCommand::ResumeWorkstream => {
                 let Some(workstream_id) = self.selected_workstream_id() else {
@@ -2054,6 +2472,106 @@ impl DashboardApp {
 
         self.sync_repo_selection();
         self.sync_workstream_selection();
+        Ok(DashboardAction::None)
+    }
+
+    fn open_or_pick_selected_workstream(
+        &mut self,
+        launch_mode: LaunchMode,
+    ) -> anyhow::Result<DashboardAction> {
+        let Some(workstream_id) = self.selected_workstream_id() else {
+            self.set_status("Select a workstream first.".to_string());
+            return Ok(DashboardAction::None);
+        };
+        self.open_or_pick_workstream(workstream_id, launch_mode)
+    }
+
+    fn open_or_pick_workstream(
+        &mut self,
+        workstream_id: Uuid,
+        launch_mode: LaunchMode,
+    ) -> anyhow::Result<DashboardAction> {
+        let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
+        let Some(session) = workstream.preferred_session().cloned() else {
+            self.set_status("This workstream does not have a session yet.".to_string());
+            return Ok(DashboardAction::None);
+        };
+
+        if workstream.session_count() > 1 {
+            self.modal = Some(Modal::SessionPicker(SessionPickerModal {
+                workstream_id,
+                branch: workstream.branch,
+                launch_mode,
+                selected: workstream
+                    .sessions
+                    .iter()
+                    .position(|candidate| candidate.id == session.id)
+                    .unwrap_or(0),
+            }));
+            return Ok(DashboardAction::None);
+        }
+
+        self.runtime
+            .set_preferred_session(workstream_id, session.id)?;
+        self.select_workstream_by_id(workstream_id);
+
+        match launch_mode {
+            LaunchMode::Attach => Ok(DashboardAction::Attach(workstream_id, session.id)),
+            LaunchMode::Open => {
+                let result = self
+                    .runtime
+                    .open_workstream_session(workstream_id, session.id)
+                    .map(|_| "Opened workstream in a new tab.".to_string());
+                self.set_status_from_result(result);
+                Ok(DashboardAction::None)
+            }
+            LaunchMode::Stay => Ok(DashboardAction::None),
+        }
+    }
+
+    fn open_launch_session_modal(
+        &mut self,
+        workstream_id: Uuid,
+        launch_mode: LaunchMode,
+    ) -> anyhow::Result<DashboardAction> {
+        let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
+        self.modal = Some(Modal::LaunchSession(LaunchSessionModal {
+            workstream_id,
+            branch: workstream.branch,
+            launch_mode,
+            selected: self
+                .runtime
+                .config
+                .agent_presets
+                .iter()
+                .position(|preset| preset.name == workstream.agent_preset)
+                .unwrap_or(0),
+        }));
+        Ok(DashboardAction::None)
+    }
+
+    fn open_one_off_modal(&mut self, workstream_id: Uuid) -> anyhow::Result<DashboardAction> {
+        let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
+        let agents = one_off_agent_names(&self.runtime);
+        if agents.is_empty() {
+            self.set_status("No one-off agents are configured.".to_string());
+            return Ok(DashboardAction::None);
+        }
+        let selected = workstream
+            .preferred_session()
+            .and_then(|session| {
+                agents
+                    .iter()
+                    .position(|agent| agent == &session.agent_preset)
+            })
+            .unwrap_or(0);
+        self.modal = Some(Modal::OneOff(OneOffModal {
+            workstream_id,
+            branch: workstream.branch,
+            prompt: String::new(),
+            output: None,
+            selected,
+        }));
         Ok(DashboardAction::None)
     }
 
@@ -2404,6 +2922,16 @@ fn filtered_strings(items: &[String], filter: &str) -> Vec<String> {
         .collect()
 }
 
+fn one_off_agent_names(runtime: &MicoRuntime) -> Vec<String> {
+    runtime
+        .config
+        .agent_presets
+        .iter()
+        .filter(|preset| preset.one_off_command.is_some())
+        .map(|preset| preset.name.clone())
+        .collect()
+}
+
 fn line_from_pairs(items: &[(&str, &str)]) -> Line<'static> {
     let mut spans = Vec::new();
 
@@ -2416,6 +2944,47 @@ fn line_from_pairs(items: &[(&str, &str)]) -> Line<'static> {
     }
 
     Line::from(spans)
+}
+
+fn session_picker_item(session: &WorkstreamSession) -> ListItem<'static> {
+    let status = match session.status {
+        WorkstreamStatus::Running => "running",
+        WorkstreamStatus::Stopped => "stopped",
+    };
+    let status_color = if matches!(session.status, WorkstreamStatus::Running) {
+        SUCCESS_GREEN
+    } else {
+        WARNING_AMBER
+    };
+    ListItem::new(vec![
+        Line::from(vec![
+            Span::styled(
+                session.agent_preset.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            Span::styled(
+                format!("[{}]", status.to_uppercase()),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        line_from_stat_pairs(&[
+            ("session".to_string(), session.session_name.clone()),
+            (
+                "last touch".to_string(),
+                option_elapsed_label(
+                    session
+                        .last_attached_at_epoch_secs
+                        .or(session.last_opened_at_epoch_secs),
+                ),
+            ),
+        ]),
+        Line::from(""),
+    ])
 }
 
 fn line_from_stat_pairs(items: &[(String, String)]) -> Line<'static> {
@@ -2595,12 +3164,7 @@ fn workstream_attention_rank(workstream: &Workstream) -> u8 {
 }
 
 fn latest_activity_epoch_secs(workstream: &Workstream) -> u64 {
-    workstream
-        .last_attached_at_epoch_secs
-        .into_iter()
-        .chain(workstream.last_opened_at_epoch_secs)
-        .max()
-        .unwrap_or(workstream.created_at_epoch_secs)
+    workstream.latest_activity_epoch_secs()
 }
 
 fn workstream_state_label(workstream: &Workstream) -> &'static str {
