@@ -41,6 +41,12 @@ pub struct AgentOneOffResult {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct NotificationRequest {
+    pub title: String,
+    pub body: String,
+}
+
 pub trait ConfigStore {
     fn load_or_create_config(&self, default: AppConfig) -> anyhow::Result<AppConfig>;
     fn save_config(&self, config: &AppConfig) -> anyhow::Result<()>;
@@ -106,6 +112,10 @@ pub trait CommandRunner {
 pub trait OperationLog {
     fn record(&self, event: &OperationEvent) -> anyhow::Result<()>;
     fn recent(&self, limit: usize) -> anyhow::Result<Vec<OperationEvent>>;
+}
+
+pub trait Notifier {
+    fn notify(&self, request: &NotificationRequest) -> anyhow::Result<()>;
 }
 
 pub trait TaskCompletionStore {

@@ -31,7 +31,7 @@ use crate::{
         runtime::{LaunchMode, MicoRuntime},
     },
     domain::model::{
-        Workstream, WorkstreamAttention, WorkstreamRequest, WorkstreamSession, WorkstreamStatus,
+        AttentionReason, Workstream, WorkstreamRequest, WorkstreamSession, WorkstreamStatus,
     },
 };
 
@@ -156,31 +156,23 @@ enum DeferredAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkstreamView {
     All,
-    NeedsAttention,
+    NeedsYou,
     Running,
     Stopped,
-    Pinned,
 }
 
 impl WorkstreamView {
     fn label(self) -> &'static str {
         match self {
             Self::All => "all",
-            Self::NeedsAttention => "attention",
+            Self::NeedsYou => "needs-you",
             Self::Running => "running",
             Self::Stopped => "stopped",
-            Self::Pinned => "pinned",
         }
     }
 
     fn cycle(self, delta: isize) -> Self {
-        let options = [
-            Self::All,
-            Self::NeedsAttention,
-            Self::Running,
-            Self::Stopped,
-            Self::Pinned,
-        ];
+        let options = [Self::All, Self::NeedsYou, Self::Running, Self::Stopped];
         let index = options
             .iter()
             .position(|candidate| *candidate == self)
@@ -352,7 +344,6 @@ enum Modal {
     OneOff(OneOffModal),
     SessionPicker(SessionPickerModal),
     WorkstreamFilter(WorkstreamFilterModal),
-    Triage(TriageModal),
 }
 
 #[derive(Debug, Clone)]
@@ -396,22 +387,6 @@ struct SessionPickerModal {
     branch: String,
     launch_mode: LaunchMode,
     selected: usize,
-}
-
-#[derive(Debug, Clone)]
-struct TriageModal {
-    workstream_id: Uuid,
-    branch: String,
-    pinned: bool,
-    selected: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum TriageAction {
-    ReviewNext,
-    Blocked,
-    TogglePin,
-    Clear,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -495,6 +470,7 @@ struct DashboardApp {
     recent_output_workstream_id: Option<Uuid>,
     recent_output_lines: Vec<String>,
     last_output_refresh: Option<Instant>,
+    last_attention_refresh: Option<Instant>,
     background_tasks: BackgroundTaskManager,
     deferred_actions: VecDeque<DeferredAction>,
 }
@@ -536,6 +512,7 @@ impl DashboardApp {
             recent_output_workstream_id: None,
             recent_output_lines: Vec::new(),
             last_output_refresh: None,
+            last_attention_refresh: None,
             background_tasks,
             deferred_actions: VecDeque::new(),
         }
@@ -543,6 +520,7 @@ impl DashboardApp {
 
     fn render(&mut self, frame: &mut Frame<'_>) {
         self.refresh_app_vitals();
+        self.refresh_attention_signals();
         self.refresh_recent_output();
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -614,16 +592,12 @@ impl DashboardApp {
             })
             .collect::<Vec<_>>()
             .join("   ");
-        let attention_count = self
+        let needs_you_count = self
             .runtime
             .state
             .workstreams
             .iter()
-            .filter(|workstream| {
-                workstream.pinned
-                    || !matches!(workstream.attention, WorkstreamAttention::None)
-                    || matches!(workstream.status, WorkstreamStatus::Stopped)
-            })
+            .filter(|workstream| workstream.has_unread_attention())
             .count();
         let running_count = self
             .runtime
@@ -632,7 +606,7 @@ impl DashboardApp {
             .iter()
             .filter(|workstream| matches!(workstream.status, WorkstreamStatus::Running))
             .count();
-        let footer = Paragraph::new(self.flight_deck_line(attention_count, running_count))
+        let footer = Paragraph::new(self.flight_deck_line(needs_you_count, running_count))
             .wrap(Wrap { trim: false })
             .alignment(Alignment::Left);
 
@@ -670,7 +644,9 @@ impl DashboardApp {
             .split(area);
 
         let repo_items: Vec<ListItem<'_>> = if self.runtime.state.repos.is_empty() {
-            vec![ListItem::new("No missions tracked yet. Press : and choose Add mission.")]
+            vec![ListItem::new(
+                "No missions tracked yet. Press : and choose Add mission.",
+            )]
         } else {
             self.runtime
                 .state
@@ -801,27 +777,23 @@ impl DashboardApp {
                                 ("Enter/o", "open here"),
                                 ("a", "new tab"),
                                 ("n", "new session"),
-                                ("t", "triage"),
                                 ("x", "stop"),
                             ]),
                             (WorkstreamStatus::Running, _) => line_from_pairs(&[
                                 ("Enter/o", "pick session"),
                                 ("a", "pick new tab"),
                                 ("n", "new session"),
-                                ("t", "triage"),
                                 ("x", "stop"),
                             ]),
                             (WorkstreamStatus::Stopped, 0 | 1) => line_from_pairs(&[
                                 ("Enter/o", "resume here"),
                                 ("a", "resume in new tab"),
                                 ("n", "new session"),
-                                ("t", "triage"),
                             ]),
                             (WorkstreamStatus::Stopped, _) => line_from_pairs(&[
                                 ("Enter/o", "pick session"),
                                 ("a", "pick new tab"),
                                 ("n", "new session"),
-                                ("t", "triage"),
                             ]),
                         };
                         lines.push(hint);
@@ -880,13 +852,25 @@ impl DashboardApp {
             .filter_map(|workstream_id| self.runtime.workstream_by_id(*workstream_id).ok())
             .collect::<Vec<_>>();
 
-        let blocked = workstreams
+        let needs_you = workstreams
             .iter()
-            .filter(|workstream| matches!(workstream.attention, WorkstreamAttention::Blocked))
+            .filter(|workstream| workstream.has_unread_attention())
             .count();
-        let review = workstreams
+        let failed = workstreams
             .iter()
-            .filter(|workstream| matches!(workstream.attention, WorkstreamAttention::ReviewNext))
+            .filter(|workstream| has_unread_reason(workstream, AttentionReason::TaskFailed))
+            .count();
+        let done = workstreams
+            .iter()
+            .filter(|workstream| has_unread_reason(workstream, AttentionReason::OneOffCompleted))
+            .count();
+        let idle = workstreams
+            .iter()
+            .filter(|workstream| has_unread_reason(workstream, AttentionReason::IdleOutput))
+            .count();
+        let drift = workstreams
+            .iter()
+            .filter(|workstream| has_unread_reason(workstream, AttentionReason::BranchChanged))
             .count();
         let stopped = workstreams
             .iter()
@@ -910,12 +894,22 @@ impl DashboardApp {
                         workstream
                             .last_attached_at_epoch_secs
                             .or(workstream.last_opened_at_epoch_secs)
-                    )
+                    ),
                 )
             })
             .unwrap_or_else(|| "select a workstream to inspect its current signal.".to_string());
-        let selected_line = selected_line.replace("workstream", "launch");
-        let block = Block::default().borders(Borders::ALL).title("Pulse");
+        let selected_line = self
+            .selected_workstream()
+            .and_then(|workstream| {
+                workstream
+                    .latest_unread_attention_event()
+                    .or_else(|| workstream.latest_attention_event())
+                    .map(|event| format!("{selected_line}   signal {}", event.summary))
+            })
+            .unwrap_or_else(|| selected_line.replace("workstream", "launch"));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title("Attention Inbox");
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -944,8 +938,8 @@ impl DashboardApp {
         } else {
             vec![
                 Line::from(format!(
-                    "blocked {}   review {}   running {}   stopped {}",
-                    blocked, review, running, stopped
+                    "needs you {}   failed {}   idle {}   done {}   drift {}   running {}   stopped {}",
+                    needs_you, failed, idle, done, drift, running, stopped
                 )),
                 Line::styled(selected_line, Style::default().fg(MUTED_TEXT)),
             ]
@@ -955,7 +949,53 @@ impl DashboardApp {
             chunks[0],
         );
 
-        let output_lines = if self.recent_output_lines.is_empty() {
+        let mut inbox_entries = workstreams
+            .iter()
+            .filter_map(|workstream| {
+                workstream
+                    .latest_unread_attention_event()
+                    .map(|event| (workstream, event))
+            })
+            .collect::<Vec<_>>();
+        inbox_entries.sort_by(|(_, left), (_, right)| {
+            right
+                .created_at_epoch_secs
+                .cmp(&left.created_at_epoch_secs)
+                .then_with(|| left.summary.cmp(&right.summary))
+        });
+
+        let selected_attention_detail = self
+            .selected_workstream_id()
+            .and_then(|workstream_id| self.runtime.latest_attention_detail(workstream_id).ok())
+            .flatten();
+
+        let output_lines = if let Some(detail) = selected_attention_detail {
+            detail
+                .lines()
+                .map(|line| Line::styled(line.to_string(), Style::default().fg(LIVE_OUTPUT)))
+                .collect::<Vec<_>>()
+        } else if !inbox_entries.is_empty() {
+            inbox_entries
+                .into_iter()
+                .map(|(workstream, event)| {
+                    Line::from(vec![
+                        Span::styled(
+                            format!("[{}] ", attention_reason_label(&event.reason)),
+                            Style::default()
+                                .fg(attention_reason_color(&event.reason))
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("{} ", workstream.branch),
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(event.summary.clone(), Style::default().fg(MUTED_TEXT)),
+                    ])
+                })
+                .collect::<Vec<_>>()
+        } else if self.recent_output_lines.is_empty() {
             vec![Line::styled(
                 "live waiting for pane output",
                 Style::default().fg(LIVE_OUTPUT),
@@ -972,7 +1012,7 @@ impl DashboardApp {
         );
     }
 
-    fn flight_deck_line(&self, attention_count: usize, running_count: usize) -> Line<'static> {
+    fn flight_deck_line(&self, needs_you_count: usize, running_count: usize) -> Line<'static> {
         let orbit = ["north", "east", "south", "west"];
         let orbit_len = u64::try_from(orbit.len()).unwrap_or(1);
         let orbit_index =
@@ -1024,7 +1064,7 @@ impl DashboardApp {
                     self.runtime.state.workstreams.len().to_string(),
                 ));
                 pairs.push(("running".to_string(), running_count.to_string()));
-                pairs.push(("attention".to_string(), attention_count.to_string()));
+                pairs.push(("needs-you".to_string(), needs_you_count.to_string()));
                 pairs.push((
                     "jobs".to_string(),
                     self.background_tasks.active_tasks().len().to_string(),
@@ -1109,7 +1149,6 @@ impl DashboardApp {
                 ("!", "one-off"),
                 ("v", "open in code"),
                 ("/", "filter"),
-                ("t", "triage"),
                 ("[/]", "views"),
                 ("s", "sort"),
                 ("x", "stop"),
@@ -1138,9 +1177,7 @@ impl DashboardApp {
                 status_style(status.tone),
             ),
             Line::from(selected_repo.unwrap_or_else(|| "selected mission: none".to_string())),
-            Line::from(
-                selected_workstream.unwrap_or_else(|| "selected launch: none".to_string()),
-            ),
+            Line::from(selected_workstream.unwrap_or_else(|| "selected launch: none".to_string())),
             jobs_line,
             context_line,
             global_line,
@@ -1230,7 +1267,6 @@ impl DashboardApp {
             Modal::OneOff(model) => self.render_one_off_modal(frame, model),
             Modal::SessionPicker(model) => self.render_session_picker_modal(frame, model),
             Modal::WorkstreamFilter(model) => self.render_workstream_filter_modal(frame, model),
-            Modal::Triage(model) => self.render_triage_modal(frame, model),
         }
     }
 
@@ -1313,47 +1349,6 @@ impl DashboardApp {
         frame.render_widget(body, area);
     }
 
-    fn render_triage_modal(&self, frame: &mut Frame<'_>, modal: &TriageModal) {
-        let area = centered_rect(54, 34, frame.area());
-        frame.render_widget(Clear, area);
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(5), Constraint::Min(6)])
-            .split(area);
-
-        let help = Paragraph::new(Text::from(vec![
-            Line::from(format!("Triage `{}`", modal.branch)),
-            line_from_pairs(&[
-                ("r", "review"),
-                ("b", "blocked"),
-                ("p", "pin"),
-                ("c", "clear"),
-                ("Esc", "cancel"),
-            ]),
-        ]))
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::ALL).title("Triage"));
-
-        let options = triage_actions(modal)
-            .into_iter()
-            .map(|action| ListItem::new(triage_action_label(action, modal)))
-            .collect::<Vec<_>>();
-        let mut state = ListState::default();
-        state.select(Some(modal.selected.min(options.len().saturating_sub(1))));
-
-        let list = List::new(options)
-            .block(Block::default().borders(Borders::ALL).title("Actions"))
-            .highlight_style(
-                Style::default()
-                    .bg(PANEL_HIGHLIGHT)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol(">> ");
-
-        frame.render_widget(help, layout[0]);
-        frame.render_stateful_widget(list, layout[1], &mut state);
-    }
-
     fn render_session_picker_modal(&self, frame: &mut Frame<'_>, modal: &SessionPickerModal) {
         let area = centered_rect(66, 42, frame.area());
         frame.render_widget(Clear, area);
@@ -1404,7 +1399,10 @@ impl DashboardApp {
         let area = centered_rect(58, 30, frame.area());
         frame.render_widget(Clear, area);
         let help = Paragraph::new(Text::from(vec![
-            Line::from(format!("Launch another session for launch `{}`", modal.branch)),
+            Line::from(format!(
+                "Launch another session for launch `{}`",
+                modal.branch
+            )),
             line_from_pairs(&[("↑↓", "move"), ("Enter", "launch"), ("Esc", "cancel")]),
         ]))
         .wrap(Wrap { trim: false })
@@ -1792,9 +1790,6 @@ impl DashboardApp {
                 }
                 Ok(DashboardAction::None)
             }
-            KeyCode::Char('t') if self.focus == FocusPane::Workstreams => {
-                self.open_selected_workstream_triage()
-            }
             _ => Ok(DashboardAction::None),
         }
     }
@@ -2128,49 +2123,6 @@ impl DashboardApp {
                     _ => {
                         self.modal = Some(Modal::WorkstreamFilter(model));
                     }
-                }
-                Ok(DashboardAction::None)
-            }
-            Modal::Triage(mut model) => {
-                let actions = triage_actions(&model);
-                match key.code {
-                    KeyCode::Esc => self.modal = None,
-                    KeyCode::Char('r') => {
-                        self.modal = None;
-                        return self
-                            .apply_triage_action(model.workstream_id, TriageAction::ReviewNext);
-                    }
-                    KeyCode::Char('b') => {
-                        self.modal = None;
-                        return self
-                            .apply_triage_action(model.workstream_id, TriageAction::Blocked);
-                    }
-                    KeyCode::Char('p') => {
-                        self.modal = None;
-                        return self
-                            .apply_triage_action(model.workstream_id, TriageAction::TogglePin);
-                    }
-                    KeyCode::Char('c') => {
-                        self.modal = None;
-                        return self.apply_triage_action(model.workstream_id, TriageAction::Clear);
-                    }
-                    KeyCode::Down => {
-                        if !actions.is_empty() {
-                            model.selected = (model.selected + 1).min(actions.len() - 1);
-                        }
-                        self.modal = Some(Modal::Triage(model));
-                    }
-                    KeyCode::Up => {
-                        model.selected = model.selected.saturating_sub(1);
-                        self.modal = Some(Modal::Triage(model));
-                    }
-                    KeyCode::Enter => {
-                        self.modal = None;
-                        if let Some(action) = actions.get(model.selected).copied() {
-                            return self.apply_triage_action(model.workstream_id, action);
-                        }
-                    }
-                    _ => self.modal = Some(Modal::Triage(model)),
                 }
                 Ok(DashboardAction::None)
             }
@@ -2583,11 +2535,12 @@ impl DashboardApp {
                     .position(|agent| agent == &session.agent_preset)
             })
             .unwrap_or(0);
+        let output = self.runtime.latest_one_off_detail(workstream_id)?;
         self.modal = Some(Modal::OneOff(OneOffModal {
             workstream_id,
             branch: workstream.branch,
             prompt: String::new(),
-            output: None,
+            output,
             selected,
         }));
         Ok(DashboardAction::None)
@@ -2841,16 +2794,37 @@ impl DashboardApp {
                     self.apply_background_success(success, update.persisted_completion_id)
                 }
                 Err(error) => {
+                    let error_text = error.to_string();
                     if let Some(Modal::OneOff(model)) = self.modal.as_mut() {
                         let matches_workstream = update.locks.iter().any(
                             |lock| matches!(lock, TaskLock::Workstream(id) if *id == model.workstream_id),
                         );
                         if matches_workstream {
-                            model.output = Some(error.to_string());
+                            model.output = Some(error_text.clone());
+                        }
+                    }
+                    if let Some(workstream_id) = update.locks.iter().find_map(|lock| match lock {
+                        TaskLock::Workstream(id) => Some(*id),
+                        TaskLock::RepoMutation(_) => None,
+                    }) {
+                        let summary = format!("{} failed: {error_text}", update.label);
+                        if let Err(record_error) = self.runtime.record_attention(
+                            workstream_id,
+                            AttentionReason::TaskFailed,
+                            summary.clone(),
+                            true,
+                        ) {
+                            self.status = Some(StatusMessage {
+                                text: format!(
+                                    "{summary} (and failed to record attention: {record_error})"
+                                ),
+                                tone: StatusTone::Error,
+                            });
+                            continue;
                         }
                     }
                     self.status = Some(StatusMessage {
-                        text: format!("{} failed: {error}", update.label),
+                        text: format!("{} failed: {error_text}", update.label),
                         tone: StatusTone::Error,
                     });
                 }
@@ -2952,14 +2926,26 @@ impl DashboardApp {
                 if let Some(Modal::OneOff(model)) = self.modal.as_mut()
                     && model.workstream_id == workstream_id
                 {
-                    model.output = Some(output);
+                    model.output = Some(output.clone());
                 }
                 let branch = self
                     .runtime
                     .workstream_by_id(workstream_id)
                     .map(|workstream| workstream.branch.clone())
                     .unwrap_or_else(|_| "workstream".to_string());
-                Ok(format!("One-off completed for `{branch}`."))
+                self.runtime
+                    .record_attention_with_detail(
+                        workstream_id,
+                        AttentionReason::OneOffCompleted,
+                        format!("One-off completed for `{branch}`."),
+                        Some(output.clone()),
+                        true,
+                    )
+                    .map(|_| {
+                        format!(
+                            "One-off completed for `{branch}`. Select the launch to inspect the result."
+                        )
+                    })
             }
         };
 
@@ -3090,14 +3076,9 @@ impl DashboardApp {
             .iter()
             .filter(|workstream| match self.workstream_view {
                 WorkstreamView::All => true,
-                WorkstreamView::NeedsAttention => {
-                    workstream.pinned
-                        || !matches!(workstream.attention, WorkstreamAttention::None)
-                        || matches!(workstream.status, WorkstreamStatus::Stopped)
-                }
+                WorkstreamView::NeedsYou => workstream.has_unread_attention(),
                 WorkstreamView::Running => matches!(workstream.status, WorkstreamStatus::Running),
                 WorkstreamView::Stopped => matches!(workstream.status, WorkstreamStatus::Stopped),
-                WorkstreamView::Pinned => workstream.pinned,
             })
             .filter(|workstream| {
                 if query.is_empty() {
@@ -3131,106 +3112,6 @@ impl DashboardApp {
             .into_iter()
             .map(|workstream| workstream.id)
             .collect()
-    }
-
-    fn open_selected_workstream_triage(&mut self) -> anyhow::Result<DashboardAction> {
-        let Some(workstream_id) = self.selected_workstream_id() else {
-            self.set_status("Select a workstream first.".to_string());
-            return Ok(DashboardAction::None);
-        };
-
-        let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
-        self.modal = Some(Modal::Triage(TriageModal {
-            workstream_id,
-            branch: workstream.branch,
-            pinned: workstream.pinned,
-            selected: 0,
-        }));
-        Ok(DashboardAction::None)
-    }
-
-    fn apply_triage_action(
-        &mut self,
-        workstream_id: Uuid,
-        action: TriageAction,
-    ) -> anyhow::Result<DashboardAction> {
-        match action {
-            TriageAction::ReviewNext => {
-                self.toggle_selected_workstream_attention(WorkstreamAttention::ReviewNext)
-            }
-            TriageAction::Blocked => {
-                self.toggle_selected_workstream_attention(WorkstreamAttention::Blocked)
-            }
-            TriageAction::TogglePin => self.toggle_selected_workstream_pin(),
-            TriageAction::Clear => self.clear_selected_workstream_triage(),
-        }?;
-        self.select_workstream_by_id(workstream_id);
-        Ok(DashboardAction::None)
-    }
-
-    fn toggle_selected_workstream_attention(
-        &mut self,
-        attention: WorkstreamAttention,
-    ) -> anyhow::Result<DashboardAction> {
-        let Some(workstream_id) = self.selected_workstream_id() else {
-            self.set_status("Select a workstream first.".to_string());
-            return Ok(DashboardAction::None);
-        };
-
-        let current = self
-            .runtime
-            .workstream_by_id(workstream_id)?
-            .attention
-            .clone();
-        let result = if current == attention {
-            self.runtime
-                .clear_workstream_attention(workstream_id)
-                .map(|branch| format!("Cleared attention for `{branch}`."))
-        } else {
-            let label = attention_label(&attention).to_lowercase();
-            self.runtime
-                .set_workstream_attention(workstream_id, attention)
-                .map(|branch| format!("Marked `{branch}` as {label}."))
-        };
-
-        self.set_status_from_result(result);
-        self.select_workstream_by_id(workstream_id);
-        Ok(DashboardAction::None)
-    }
-
-    fn toggle_selected_workstream_pin(&mut self) -> anyhow::Result<DashboardAction> {
-        let Some(workstream_id) = self.selected_workstream_id() else {
-            self.set_status("Select a workstream first.".to_string());
-            return Ok(DashboardAction::None);
-        };
-
-        let result =
-            self.runtime
-                .toggle_workstream_pinned(workstream_id)
-                .map(|(branch, pinned)| {
-                    if pinned {
-                        format!("Pinned `{branch}`.")
-                    } else {
-                        format!("Unpinned `{branch}`.")
-                    }
-                });
-        self.set_status_from_result(result);
-        self.select_workstream_by_id(workstream_id);
-        Ok(DashboardAction::None)
-    }
-
-    fn clear_selected_workstream_triage(&mut self) -> anyhow::Result<DashboardAction> {
-        let Some(workstream_id) = self.selected_workstream_id() else {
-            self.set_status("Select a workstream first.".to_string());
-            return Ok(DashboardAction::None);
-        };
-
-        let branch = self.runtime.workstream_by_id(workstream_id)?.branch.clone();
-        self.runtime.clear_workstream_attention(workstream_id)?;
-        self.runtime.set_workstream_pinned(workstream_id, false)?;
-        self.set_status_from_result(Ok(format!("Cleared triage for `{branch}`.")));
-        self.select_workstream_by_id(workstream_id);
-        Ok(DashboardAction::None)
     }
 
     fn filtered_palette_entries(&self, palette: &PaletteStateModel) -> Vec<PaletteEntry> {
@@ -3330,6 +3211,23 @@ impl DashboardApp {
             .runtime
             .recent_workstream_output(workstream_id, 5)
             .unwrap_or_else(|error| vec![format!("output unavailable: {error}")]);
+    }
+
+    fn refresh_attention_signals(&mut self) {
+        let now = Instant::now();
+        if let Some(last_refresh) = self.last_attention_refresh
+            && now.duration_since(last_refresh) < Duration::from_secs(15)
+        {
+            return;
+        }
+
+        self.last_attention_refresh = Some(now);
+        if let Err(error) = self.runtime.reconcile_workstream_output_activity() {
+            self.status = Some(StatusMessage {
+                text: format!("Failed to refresh launch attention: {error}"),
+                tone: StatusTone::Error,
+            });
+        }
     }
 
     fn confirm_quit(&mut self, key: QuitKey, label: &str) -> anyhow::Result<DashboardAction> {
@@ -3512,30 +3410,6 @@ fn key_chip(key: &str) -> Span<'static> {
     )
 }
 
-fn triage_actions(_modal: &TriageModal) -> Vec<TriageAction> {
-    vec![
-        TriageAction::ReviewNext,
-        TriageAction::Blocked,
-        TriageAction::TogglePin,
-        TriageAction::Clear,
-    ]
-}
-
-fn triage_action_label(action: TriageAction, modal: &TriageModal) -> String {
-    match action {
-        TriageAction::ReviewNext => "Mark review next".to_string(),
-        TriageAction::Blocked => "Mark blocked".to_string(),
-        TriageAction::TogglePin => {
-            if modal.pinned {
-                "Unpin workstream".to_string()
-            } else {
-                "Pin workstream".to_string()
-            }
-        }
-        TriageAction::Clear => "Clear triage".to_string(),
-    }
-}
-
 fn prioritize_branches(mut branches: Vec<String>) -> Vec<String> {
     branches.sort_by_key(|branch| {
         let rank = match branch.as_str() {
@@ -3558,11 +3432,6 @@ fn preferred_branch_index(branches: &[String]) -> usize {
 }
 
 fn compare_workstreams(left: &Workstream, right: &Workstream, sort: WorkstreamSort) -> Ordering {
-    let pinned_cmp = right.pinned.cmp(&left.pinned);
-    if pinned_cmp != Ordering::Equal {
-        return pinned_cmp;
-    }
-
     match sort {
         WorkstreamSort::Attention => {
             let rank_cmp = workstream_attention_rank(left).cmp(&workstream_attention_rank(right));
@@ -3570,14 +3439,9 @@ fn compare_workstreams(left: &Workstream, right: &Workstream, sort: WorkstreamSo
                 return rank_cmp;
             }
 
-            let age_cmp = left
-                .status_changed_at_epoch_secs
-                .cmp(&right.status_changed_at_epoch_secs);
-            if age_cmp != Ordering::Equal {
-                return age_cmp;
-            }
-
-            left.branch.cmp(&right.branch)
+            latest_activity_epoch_secs(right)
+                .cmp(&latest_activity_epoch_secs(left))
+                .then_with(|| left.branch.cmp(&right.branch))
         }
         WorkstreamSort::Recent => {
             let recent_cmp =
@@ -3597,13 +3461,13 @@ fn compare_workstreams(left: &Workstream, right: &Workstream, sort: WorkstreamSo
 }
 
 fn workstream_attention_rank(workstream: &Workstream) -> u8 {
-    match workstream.attention {
-        WorkstreamAttention::Blocked => 0,
-        WorkstreamAttention::ReviewNext => 1,
-        WorkstreamAttention::None => match workstream.status {
-            WorkstreamStatus::Stopped => 2,
-            WorkstreamStatus::Running => 3,
-        },
+    if let Some(event) = workstream.latest_unread_attention_event() {
+        return attention_reason_rank(&event.reason);
+    }
+
+    match workstream.status {
+        WorkstreamStatus::Running => 4,
+        WorkstreamStatus::Stopped => 5,
     }
 }
 
@@ -3612,13 +3476,13 @@ fn latest_activity_epoch_secs(workstream: &Workstream) -> u64 {
 }
 
 fn workstream_state_label(workstream: &Workstream) -> &'static str {
-    match workstream.attention {
-        WorkstreamAttention::Blocked => "blocked",
-        WorkstreamAttention::ReviewNext => "review next",
-        WorkstreamAttention::None => match workstream.status {
-            WorkstreamStatus::Running => "running",
-            WorkstreamStatus::Stopped => "stopped",
-        },
+    if let Some(event) = workstream.latest_unread_attention_event() {
+        return attention_reason_state_label(&event.reason);
+    }
+
+    match workstream.status {
+        WorkstreamStatus::Running => "running",
+        WorkstreamStatus::Stopped => "stopped",
     }
 }
 
@@ -3632,14 +3496,17 @@ fn workstream_chips(workstream: &Workstream) -> Vec<Span<'static>> {
         chips.push(label_chip("LINKED", INFO_BLUE));
     }
 
-    if workstream.pinned {
-        chips.push(label_chip("PIN", INFO_BLUE));
-    }
-
-    match workstream.attention {
-        WorkstreamAttention::None => {}
-        WorkstreamAttention::ReviewNext => chips.push(label_chip("REVIEW", WARNING_AMBER)),
-        WorkstreamAttention::Blocked => chips.push(label_chip("BLOCKED", ERROR_RED)),
+    if let Some(event) = workstream.latest_unread_attention_event() {
+        chips.push(label_chip(
+            attention_reason_chip(&event.reason),
+            attention_reason_color(&event.reason),
+        ));
+        if workstream.unread_attention_count() > 1 {
+            chips.push(dynamic_label_chip(
+                format!("NEW {}", workstream.unread_attention_count()),
+                INFO_BLUE,
+            ));
+        }
     }
 
     match workstream.status {
@@ -3657,11 +3524,61 @@ fn label_chip(label: &str, color: Color) -> Span<'static> {
     )
 }
 
-fn attention_label(attention: &WorkstreamAttention) -> &'static str {
-    match attention {
-        WorkstreamAttention::None => "none",
-        WorkstreamAttention::ReviewNext => "review next",
-        WorkstreamAttention::Blocked => "blocked",
+fn dynamic_label_chip(label: String, color: Color) -> Span<'static> {
+    Span::styled(
+        format!("[{label}]"),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    )
+}
+
+fn has_unread_reason(workstream: &Workstream, reason: AttentionReason) -> bool {
+    workstream
+        .attention_events
+        .iter()
+        .any(|event| !event.seen && event.reason == reason)
+}
+
+fn attention_reason_rank(reason: &AttentionReason) -> u8 {
+    match reason {
+        AttentionReason::TaskFailed => 0,
+        AttentionReason::SessionStopped => 1,
+        AttentionReason::IdleOutput => 2,
+        AttentionReason::BranchChanged => 3,
+        AttentionReason::OneOffCompleted => 4,
+    }
+}
+
+fn attention_reason_state_label(reason: &AttentionReason) -> &'static str {
+    match reason {
+        AttentionReason::TaskFailed => "failed",
+        AttentionReason::OneOffCompleted => "done",
+        AttentionReason::SessionStopped => "waiting",
+        AttentionReason::IdleOutput => "idle",
+        AttentionReason::BranchChanged => "drifted",
+    }
+}
+
+fn attention_reason_label(reason: &AttentionReason) -> &'static str {
+    match reason {
+        AttentionReason::TaskFailed => "FAILED",
+        AttentionReason::OneOffCompleted => "DONE",
+        AttentionReason::SessionStopped => "WAITING",
+        AttentionReason::IdleOutput => "IDLE",
+        AttentionReason::BranchChanged => "DRIFT",
+    }
+}
+
+fn attention_reason_chip(reason: &AttentionReason) -> &'static str {
+    attention_reason_label(reason)
+}
+
+fn attention_reason_color(reason: &AttentionReason) -> Color {
+    match reason {
+        AttentionReason::TaskFailed => ERROR_RED,
+        AttentionReason::OneOffCompleted => SUCCESS_GREEN,
+        AttentionReason::SessionStopped => WARNING_AMBER,
+        AttentionReason::IdleOutput => WARNING_AMBER,
+        AttentionReason::BranchChanged => INFO_BLUE,
     }
 }
 

@@ -482,14 +482,13 @@ fn run_task(
                 session_name: session.session_name.clone(),
                 agent_preset: session.agent_preset.clone(),
                 status: WorkstreamStatus::Running,
-                attention: crate::domain::model::WorkstreamAttention::None,
-                pinned: false,
                 created_at_epoch_secs: now_epoch_secs(),
                 status_changed_at_epoch_secs: now_epoch_secs(),
                 last_opened_at_epoch_secs: None,
                 last_attached_at_epoch_secs: None,
                 sessions: vec![session.clone()],
                 preferred_session_id: Some(session.id),
+                attention_events: Vec::new(),
             };
             workstream.sync_legacy_summary();
             Ok(TaskSuccess::WorkstreamCreated { workstream })
@@ -831,6 +830,9 @@ fn new_session_record(
         status_changed_at_epoch_secs: now,
         last_opened_at_epoch_secs: None,
         last_attached_at_epoch_secs: None,
+        last_output_at_epoch_secs: None,
+        last_output_digest: None,
+        last_idle_alert_at_epoch_secs: None,
     }
 }
 

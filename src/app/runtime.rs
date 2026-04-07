@@ -13,19 +13,20 @@ use uuid::Uuid;
 use crate::{
     app::background::PersistedTaskResult,
     app::ports::{
-        AgentOneOffRequest, CommandRunner, DependencyInspector, OperationLog, RepoService,
-        RuntimeStore, SessionBackend, SessionCreateRequest, SessionLabel, TaskCompletionStore,
-        TerminalFrontend,
+        AgentOneOffRequest, CommandRunner, DependencyInspector, NotificationRequest, Notifier,
+        OperationLog, RepoService, RuntimeStore, SessionBackend, SessionCreateRequest,
+        SessionLabel, TaskCompletionStore, TerminalFrontend,
     },
     domain::model::{
-        AppConfig, AppPaths, DoctorReport, OperationEvent, OperationLevel, RepoTarget, StoredState,
-        Workstream, WorkstreamAttention, WorkstreamRequest, WorkstreamSession, WorkstreamStatus,
-        WorktreeOwnership,
+        AppConfig, AppPaths, AttentionReason, DoctorReport, OperationEvent, OperationLevel,
+        RepoTarget, StoredState, Workstream, WorkstreamRequest, WorkstreamSession,
+        WorkstreamStatus, WorktreeOwnership,
     },
     infra::{
         config::default_agent_presets, deps::SystemDependencyInspector, git::GitCliRepoService,
-        iterm::ITermFrontend, json_store::JsonFileStore, operations::JsonlOperationLog,
-        process::ShellCommandRunner, task_store::JsonTaskCompletionStore, tmux::TmuxSessionBackend,
+        iterm::ITermFrontend, json_store::JsonFileStore, notifier::MacOsNotifier,
+        operations::JsonlOperationLog, process::ShellCommandRunner,
+        task_store::JsonTaskCompletionStore, tmux::TmuxSessionBackend,
     },
 };
 
@@ -45,6 +46,7 @@ pub struct RuntimeInterfaces {
     pub command_runner: Box<dyn CommandRunner>,
     pub operation_log: Box<dyn OperationLog>,
     pub completion_store: Arc<dyn TaskCompletionStore + Send + Sync>,
+    pub notifier: Box<dyn Notifier>,
 }
 
 pub struct MicoRuntime {
@@ -57,6 +59,7 @@ pub struct MicoRuntime {
     command_runner: Box<dyn CommandRunner>,
     operation_log: Box<dyn OperationLog>,
     completion_store: Arc<dyn TaskCompletionStore + Send + Sync>,
+    notifier: Box<dyn Notifier>,
     pub config: AppConfig,
     pub state: StoredState,
     pub report: DoctorReport,
@@ -85,6 +88,7 @@ impl MicoRuntime {
                 command_runner: Box::new(ShellCommandRunner::new()),
                 operation_log: Box::new(JsonlOperationLog::new(operations_log_path)),
                 completion_store,
+                notifier: Box::new(MacOsNotifier::new()),
             },
             config,
             state,
@@ -109,6 +113,7 @@ impl MicoRuntime {
             command_runner: interfaces.command_runner,
             operation_log: interfaces.operation_log,
             completion_store: interfaces.completion_store,
+            notifier: interfaces.notifier,
             config,
             state,
             report,
@@ -125,6 +130,7 @@ impl MicoRuntime {
     pub fn refresh_doctor(&mut self) -> anyhow::Result<()> {
         self.report = self.dependency_inspector.doctor()?;
         self.reconcile_workstream_branches()?;
+        self.reconcile_workstream_output_activity()?;
         Ok(())
     }
 
@@ -337,14 +343,13 @@ impl MicoRuntime {
             session_name: session.session_name.clone(),
             agent_preset: session.agent_preset.clone(),
             status: WorkstreamStatus::Running,
-            attention: WorkstreamAttention::None,
-            pinned: false,
             created_at_epoch_secs: now_epoch_secs(),
             status_changed_at_epoch_secs: now_epoch_secs(),
             last_opened_at_epoch_secs: None,
             last_attached_at_epoch_secs: None,
             sessions: vec![session.clone()],
             preferred_session_id: Some(session.id),
+            attention_events: Vec::new(),
         };
         workstream.sync_legacy_summary();
 
@@ -365,6 +370,7 @@ impl MicoRuntime {
         session_id: Uuid,
     ) -> anyhow::Result<()> {
         let (_, session) = self.ensure_workstream_session(workstream_id, session_id)?;
+        self.mark_attention_seen(workstream_id)?;
         self.mark_session_opened(workstream_id, session_id)?;
         self.terminal.open_session(
             &session.session_name,
@@ -383,6 +389,7 @@ impl MicoRuntime {
         session_id: Uuid,
     ) -> anyhow::Result<()> {
         let (_, session) = self.ensure_workstream_session(workstream_id, session_id)?;
+        self.mark_attention_seen(workstream_id)?;
         self.mark_session_attached(workstream_id, session_id)?;
         self.session_backend.attach(&session.session_name)
     }
@@ -424,6 +431,10 @@ impl MicoRuntime {
         } else {
             Ok(lines)
         }
+    }
+
+    pub fn reconcile_workstream_output_activity(&mut self) -> anyhow::Result<()> {
+        self.reconcile_workstream_output_activity_at(now_epoch_secs())
     }
 
     pub fn open_workstream_in_vscode(&self, workstream_id: Uuid) -> anyhow::Result<()> {
@@ -564,14 +575,36 @@ impl MicoRuntime {
         branch_updates: Vec<(Uuid, String)>,
     ) -> anyhow::Result<()> {
         let mut changed = false;
+        let mut notifications = Vec::new();
         for (workstream_id, branch) in branch_updates {
             let Ok(target) = self.workstream_by_id_mut(workstream_id) else {
                 continue;
             };
             if target.branch != branch {
+                let previous_branch = target.branch.clone();
                 target.branch = branch;
+                let summary = format!(
+                    "Branch changed from `{previous_branch}` to `{}`.",
+                    target.branch
+                );
+                let added = target.push_attention_event(
+                    AttentionReason::BranchChanged,
+                    summary.clone(),
+                    None,
+                    false,
+                );
+                if added {
+                    notifications.push((
+                        target.branch.clone(),
+                        AttentionReason::BranchChanged,
+                        summary,
+                    ));
+                }
                 changed = true;
             }
+        }
+        for (branch, reason, summary) in notifications {
+            self.notify_best_effort(&branch, &reason, summary);
         }
         if changed {
             self.save_state()?;
@@ -749,55 +782,79 @@ impl MicoRuntime {
         Ok(target.branch)
     }
 
-    pub fn set_workstream_attention(
+    pub fn record_attention(
         &mut self,
         workstream_id: Uuid,
-        attention: WorkstreamAttention,
-    ) -> anyhow::Result<String> {
-        let branch = {
-            let target = self.workstream_by_id_mut(workstream_id)?;
-            target.attention = attention.clone();
-            target.branch.clone()
-        };
-        self.save_state()?;
-        Ok(branch)
+        reason: AttentionReason,
+        summary: impl Into<String>,
+        notify: bool,
+    ) -> anyhow::Result<()> {
+        self.record_attention_with_detail(workstream_id, reason, summary, None, notify)
     }
 
-    pub fn clear_workstream_attention(&mut self, workstream_id: Uuid) -> anyhow::Result<String> {
-        let branch = {
-            let target = self.workstream_by_id_mut(workstream_id)?;
-            target.attention = WorkstreamAttention::None;
-            target.branch.clone()
-        };
-        self.save_state()?;
-        Ok(branch)
-    }
-
-    pub fn toggle_workstream_pinned(
+    pub fn record_attention_with_detail(
         &mut self,
         workstream_id: Uuid,
-    ) -> anyhow::Result<(String, bool)> {
-        let result = {
+        reason: AttentionReason,
+        summary: impl Into<String>,
+        detail: Option<String>,
+        notify: bool,
+    ) -> anyhow::Result<()> {
+        let (branch, added) = {
             let target = self.workstream_by_id_mut(workstream_id)?;
-            target.pinned = !target.pinned;
-            (target.branch.clone(), target.pinned)
+            let summary = summary.into();
+            let added = target.push_attention_event(reason.clone(), summary.clone(), detail, false);
+            (target.branch.clone(), added)
         };
-        self.save_state()?;
-        Ok(result)
+        if added {
+            self.save_state()?;
+        }
+        if notify && added {
+            self.notify_best_effort(
+                &branch,
+                &reason,
+                self.latest_attention_summary(workstream_id)?,
+            );
+        }
+        Ok(())
     }
 
-    pub fn set_workstream_pinned(
-        &mut self,
-        workstream_id: Uuid,
-        pinned: bool,
-    ) -> anyhow::Result<String> {
-        let branch = {
+    pub fn mark_attention_seen(&mut self, workstream_id: Uuid) -> anyhow::Result<()> {
+        let changed = {
             let target = self.workstream_by_id_mut(workstream_id)?;
-            target.pinned = pinned;
-            target.branch.clone()
+            target.mark_attention_seen()
         };
-        self.save_state()?;
-        Ok(branch)
+        if changed {
+            self.save_state()?;
+        }
+        Ok(())
+    }
+
+    pub fn latest_attention_summary(&self, workstream_id: Uuid) -> anyhow::Result<String> {
+        let workstream = self.workstream_by_id(workstream_id)?;
+        Ok(workstream
+            .latest_unread_attention_event()
+            .or_else(|| workstream.latest_attention_event())
+            .map(|event| event.summary.clone())
+            .unwrap_or_else(|| workstream.branch.clone()))
+    }
+
+    pub fn latest_attention_detail(&self, workstream_id: Uuid) -> anyhow::Result<Option<String>> {
+        let workstream = self.workstream_by_id(workstream_id)?;
+        Ok(workstream
+            .latest_unread_attention_event()
+            .or_else(|| workstream.latest_attention_event())
+            .and_then(|event| event.detail.clone()))
+    }
+
+    pub fn latest_one_off_detail(&self, workstream_id: Uuid) -> anyhow::Result<Option<String>> {
+        let workstream = self.workstream_by_id(workstream_id)?;
+        Ok(workstream
+            .attention_events
+            .iter()
+            .filter(|event| matches!(event.reason, AttentionReason::OneOffCompleted))
+            .max_by_key(|event| event.created_at_epoch_secs)
+            .and_then(|event| event.detail.clone()))
     }
 
     pub fn repo_by_id(&self, repo_id: Uuid) -> anyhow::Result<&RepoTarget> {
@@ -898,15 +955,24 @@ impl MicoRuntime {
 
     pub fn reconcile_workstream_sessions(&mut self) -> anyhow::Result<()> {
         let mut changed = false;
+        let mut notifications = Vec::new();
 
         for workstream in &mut self.state.workstreams {
             workstream.ensure_session_inventory();
+            let mut pending_attention = Vec::new();
             for session in &mut workstream.sessions {
                 let has_session = self.session_backend.has_session(&session.session_name);
                 match (&session.status, has_session) {
                     (WorkstreamStatus::Running, false) => {
                         session.status = WorkstreamStatus::Stopped;
                         session.status_changed_at_epoch_secs = now_epoch_secs();
+                        pending_attention.push((
+                            workstream.branch.clone(),
+                            format!(
+                                "Session `{}` stopped and is waiting for you.",
+                                session.session_name
+                            ),
+                        ));
                         changed = true;
                     }
                     (WorkstreamStatus::Stopped, true) => {
@@ -917,7 +983,119 @@ impl MicoRuntime {
                     _ => {}
                 }
             }
+            for (branch, summary) in pending_attention {
+                let added = workstream.push_attention_event(
+                    AttentionReason::SessionStopped,
+                    summary.clone(),
+                    None,
+                    false,
+                );
+                if added {
+                    notifications.push((branch, AttentionReason::SessionStopped, summary));
+                }
+            }
             workstream.sync_legacy_summary();
+        }
+        for (branch, reason, summary) in notifications {
+            self.notify_best_effort(&branch, &reason, summary);
+        }
+
+        if changed {
+            self.save_state()?;
+        }
+
+        Ok(())
+    }
+
+    fn reconcile_workstream_output_activity_at(&mut self, now: u64) -> anyhow::Result<()> {
+        const IDLE_THRESHOLD_SECS: u64 = 10 * 60;
+
+        let mut changed = false;
+        let mut notifications = Vec::new();
+
+        for workstream in &mut self.state.workstreams {
+            workstream.ensure_session_inventory();
+            let mut idle_resolved = false;
+            let mut pending_idle_attention = Vec::new();
+
+            for session in &mut workstream.sessions {
+                if !matches!(session.status, WorkstreamStatus::Running) {
+                    continue;
+                }
+                if !self.session_backend.has_session(&session.session_name) {
+                    continue;
+                }
+
+                let lines = self
+                    .session_backend
+                    .capture_recent_lines(&session.session_name, 8)
+                    .unwrap_or_default();
+                let digest = if lines.is_empty() {
+                    None
+                } else {
+                    Some(lines.join("\n"))
+                };
+
+                if digest != session.last_output_digest {
+                    session.last_output_digest = digest;
+                    session.last_output_at_epoch_secs = Some(now);
+                    session.last_idle_alert_at_epoch_secs = None;
+                    idle_resolved = true;
+                    changed = true;
+                    continue;
+                }
+
+                let baseline = session.last_output_at_epoch_secs.unwrap_or(
+                    session
+                        .status_changed_at_epoch_secs
+                        .max(session.created_at_epoch_secs),
+                );
+                if now.saturating_sub(baseline) < IDLE_THRESHOLD_SECS {
+                    continue;
+                }
+                if session.last_idle_alert_at_epoch_secs.is_some() {
+                    continue;
+                }
+
+                let summary = format!(
+                    "No pane output for {} in `{}`.",
+                    idle_threshold_label(IDLE_THRESHOLD_SECS),
+                    session.session_name
+                );
+                let detail = if lines.is_empty() {
+                    None
+                } else {
+                    Some(lines.join("\n"))
+                };
+                session.last_idle_alert_at_epoch_secs = Some(now);
+                pending_idle_attention.push((summary, detail));
+                changed = true;
+            }
+
+            for (summary, detail) in pending_idle_attention {
+                let added = workstream.push_attention_event(
+                    AttentionReason::IdleOutput,
+                    summary.clone(),
+                    detail,
+                    false,
+                );
+                if added {
+                    notifications.push((
+                        workstream.branch.clone(),
+                        AttentionReason::IdleOutput,
+                        summary,
+                    ));
+                }
+            }
+
+            if idle_resolved && workstream.mark_attention_reason_seen(AttentionReason::IdleOutput) {
+                changed = true;
+            }
+            workstream.sync_legacy_summary();
+        }
+
+        for (branch, reason, summary) in notifications {
+            self.notify_best_effort(&branch, &reason, summary);
         }
 
         if changed {
@@ -965,6 +1143,7 @@ impl MicoRuntime {
 
     fn reconcile_workstream_branches(&mut self) -> anyhow::Result<()> {
         let mut changed = false;
+        let mut notifications = Vec::new();
 
         for workstream in &mut self.state.workstreams {
             if !workstream.worktree_path.exists() {
@@ -977,9 +1156,30 @@ impl MicoRuntime {
             };
 
             if branch != workstream.branch {
+                let previous_branch = workstream.branch.clone();
                 workstream.branch = branch;
+                let summary = format!(
+                    "Branch changed from `{previous_branch}` to `{}`.",
+                    workstream.branch
+                );
+                let added = workstream.push_attention_event(
+                    AttentionReason::BranchChanged,
+                    summary.clone(),
+                    None,
+                    false,
+                );
+                if added {
+                    notifications.push((
+                        workstream.branch.clone(),
+                        AttentionReason::BranchChanged,
+                        summary,
+                    ));
+                }
                 changed = true;
             }
+        }
+        for (branch, reason, summary) in notifications {
+            self.notify_best_effort(&branch, &reason, summary);
         }
 
         if changed {
@@ -1180,6 +1380,9 @@ impl MicoRuntime {
             status_changed_at_epoch_secs: now,
             last_opened_at_epoch_secs: None,
             last_attached_at_epoch_secs: None,
+            last_output_at_epoch_secs: None,
+            last_output_digest: None,
+            last_idle_alert_at_epoch_secs: None,
         }
     }
 
@@ -1281,6 +1484,30 @@ impl MicoRuntime {
             action: action.to_string(),
             detail,
         });
+    }
+
+    fn notify_best_effort(&self, branch: &str, reason: &AttentionReason, summary: String) {
+        let title = match reason {
+            AttentionReason::TaskFailed => format!("Launch failed: {branch}"),
+            AttentionReason::OneOffCompleted => format!("One-off complete: {branch}"),
+            AttentionReason::SessionStopped => format!("Launch stopped: {branch}"),
+            AttentionReason::BranchChanged => format!("Branch changed: {branch}"),
+            AttentionReason::IdleOutput => format!("Launch idle: {branch}"),
+        };
+        let _ = self.notifier.notify(&NotificationRequest {
+            title,
+            body: summary,
+        });
+    }
+}
+
+fn idle_threshold_label(duration_secs: u64) -> String {
+    if duration_secs < 60 {
+        format!("{duration_secs}s")
+    } else if duration_secs < 60 * 60 {
+        format!("{}m", duration_secs / 60)
+    } else {
+        format!("{}h", duration_secs / (60 * 60))
     }
 }
 

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::*;
 use crate::{
-    app::ports::{AgentOneOffResult, ConfigStore, StateStore},
+    app::ports::{AgentOneOffResult, ConfigStore, NotificationRequest, StateStore},
     domain::model::{AgentPreset, DependencyStatus, OperationEvent, WorktreePlan},
     infra::config::default_state,
 };
@@ -160,6 +160,7 @@ impl RepoService for FakeRepoService {
 #[derive(Clone, Default)]
 struct FakeSessionBackend {
     sessions: Rc<RefCell<HashMap<String, SessionCreateRequest>>>,
+    captured_lines: Rc<RefCell<HashMap<String, Vec<String>>>>,
 }
 
 impl SessionBackend for FakeSessionBackend {
@@ -167,6 +168,10 @@ impl SessionBackend for FakeSessionBackend {
         self.sessions
             .borrow_mut()
             .insert(request.session_name.clone(), request.clone());
+        self.captured_lines
+            .borrow_mut()
+            .entry(request.session_name.clone())
+            .or_insert_with(|| vec![format!("output from {}", request.session_name)]);
         Ok(())
     }
 
@@ -174,6 +179,10 @@ impl SessionBackend for FakeSessionBackend {
         self.sessions
             .borrow_mut()
             .insert(request.session_name.clone(), request.clone());
+        self.captured_lines
+            .borrow_mut()
+            .entry(request.session_name.clone())
+            .or_insert_with(|| vec![format!("output from {}", request.session_name)]);
         Ok(())
     }
 
@@ -204,7 +213,12 @@ impl SessionBackend for FakeSessionBackend {
         session_name: &str,
         _lines: usize,
     ) -> anyhow::Result<Vec<String>> {
-        Ok(vec![format!("output from {session_name}")])
+        Ok(self
+            .captured_lines
+            .borrow()
+            .get(session_name)
+            .cloned()
+            .unwrap_or_else(|| vec![format!("output from {session_name}")]))
     }
 }
 
@@ -269,6 +283,18 @@ impl OperationLog for FakeOperationLog {
 }
 
 #[derive(Clone, Default)]
+struct FakeNotifier {
+    requests: Rc<RefCell<Vec<NotificationRequest>>>,
+}
+
+impl Notifier for FakeNotifier {
+    fn notify(&self, request: &NotificationRequest) -> anyhow::Result<()> {
+        self.requests.borrow_mut().push(request.clone());
+        Ok(())
+    }
+}
+
+#[derive(Clone, Default)]
 struct FakeCompletionStore {
     completions: Arc<Mutex<Vec<crate::app::background::PersistedTaskCompletion>>>,
 }
@@ -307,7 +333,9 @@ struct RuntimeFixture {
     runtime: MicoRuntime,
     repo_id: Uuid,
     repo_service: FakeRepoService,
+    session_backend: FakeSessionBackend,
     operation_log: FakeOperationLog,
+    notifier: FakeNotifier,
     completion_store: Arc<FakeCompletionStore>,
 }
 
@@ -333,7 +361,9 @@ fn make_fixture() -> anyhow::Result<RuntimeFixture> {
     };
 
     let repo_service = FakeRepoService::default();
+    let session_backend = FakeSessionBackend::default();
     let operation_log = FakeOperationLog::default();
+    let notifier = FakeNotifier::default();
     let completion_store = Arc::new(FakeCompletionStore::default());
     let config = AppConfig {
         github_repo: None,
@@ -363,11 +393,12 @@ fn make_fixture() -> anyhow::Result<RuntimeFixture> {
         RuntimeInterfaces {
             store: Box::new(FakeStore::default()),
             repo_service: Box::new(repo_service.clone()),
-            session_backend: Box::new(FakeSessionBackend::default()),
+            session_backend: Box::new(session_backend.clone()),
             terminal: Box::new(FakeTerminalFrontend),
             dependency_inspector: Box::new(FakeDependencyInspector { paths }),
             command_runner: Box::new(FakeCommandRunner::default()),
             operation_log: Box::new(operation_log.clone()),
+            notifier: Box::new(notifier.clone()),
             completion_store: completion_store.clone(),
         },
         config,
@@ -379,7 +410,9 @@ fn make_fixture() -> anyhow::Result<RuntimeFixture> {
         runtime,
         repo_id: repo.id,
         repo_service,
+        session_backend,
         operation_log,
+        notifier,
         completion_store,
     })
 }
@@ -475,6 +508,199 @@ fn run_workstream_one_off_uses_selected_agent_template() -> anyhow::Result<()> {
 }
 
 #[test]
+fn record_attention_tracks_unread_event_and_sends_notification() -> anyhow::Result<()> {
+    let mut fixture = make_fixture()?;
+    let workstream = fixture.runtime.create_workstream(
+        fixture.repo_id,
+        WorkstreamRequest::New {
+            branch: "feature-attention".to_string(),
+            base_branch: "main".to_string(),
+        },
+        "codex",
+        LaunchMode::Stay,
+    )?;
+
+    fixture.runtime.record_attention(
+        workstream.id,
+        AttentionReason::TaskFailed,
+        "git fetch blew up",
+        true,
+    )?;
+
+    let updated = fixture.runtime.workstream_by_id(workstream.id)?;
+    assert_eq!(updated.unread_attention_count(), 1);
+    assert_eq!(
+        updated
+            .latest_unread_attention_event()
+            .map(|event| event.summary.as_str()),
+        Some("git fetch blew up")
+    );
+    assert_eq!(fixture.notifier.requests.borrow().len(), 1);
+    assert!(
+        fixture.notifier.requests.borrow()[0]
+            .title
+            .contains("feature-attention")
+    );
+    Ok(())
+}
+
+#[test]
+fn record_attention_with_detail_keeps_result_available() -> anyhow::Result<()> {
+    let mut fixture = make_fixture()?;
+    let workstream = fixture.runtime.create_workstream(
+        fixture.repo_id,
+        WorkstreamRequest::New {
+            branch: "feature-result".to_string(),
+            base_branch: "main".to_string(),
+        },
+        "codex",
+        LaunchMode::Stay,
+    )?;
+
+    fixture.runtime.record_attention_with_detail(
+        workstream.id,
+        AttentionReason::OneOffCompleted,
+        "One-off completed for `feature-result`.",
+        Some("full result output".to_string()),
+        true,
+    )?;
+
+    assert_eq!(
+        fixture.runtime.latest_attention_detail(workstream.id)?,
+        Some("full result output".to_string())
+    );
+    assert_eq!(
+        fixture.runtime.latest_one_off_detail(workstream.id)?,
+        Some("full result output".to_string())
+    );
+    Ok(())
+}
+
+#[test]
+fn opening_workstream_session_marks_attention_seen() -> anyhow::Result<()> {
+    let mut fixture = make_fixture()?;
+    let workstream = fixture.runtime.create_workstream(
+        fixture.repo_id,
+        WorkstreamRequest::New {
+            branch: "feature-open".to_string(),
+            base_branch: "main".to_string(),
+        },
+        "codex",
+        LaunchMode::Stay,
+    )?;
+
+    fixture.runtime.record_attention(
+        workstream.id,
+        AttentionReason::SessionStopped,
+        "Session stopped and is waiting for you.",
+        false,
+    )?;
+    let session_id = fixture.runtime.preferred_session_id(workstream.id)?;
+
+    fixture
+        .runtime
+        .open_workstream_session(workstream.id, session_id)?;
+
+    let updated = fixture.runtime.workstream_by_id(workstream.id)?;
+    assert_eq!(updated.unread_attention_count(), 0);
+    assert!(updated.attention_events.iter().all(|event| event.seen));
+    Ok(())
+}
+
+#[test]
+fn reconcile_workstream_sessions_notifies_when_launch_needs_you() -> anyhow::Result<()> {
+    let mut fixture = make_fixture()?;
+    let workstream = fixture.runtime.create_workstream(
+        fixture.repo_id,
+        WorkstreamRequest::New {
+            branch: "feature-waiting".to_string(),
+            base_branch: "main".to_string(),
+        },
+        "codex",
+        LaunchMode::Stay,
+    )?;
+    let session_name = fixture
+        .runtime
+        .workstream_by_id(workstream.id)?
+        .preferred_session()
+        .map(|session| session.session_name.clone())
+        .expect("session");
+
+    fixture.runtime.session_backend.stop(&session_name)?;
+    fixture.runtime.reconcile_workstream_sessions()?;
+
+    let updated = fixture.runtime.workstream_by_id(workstream.id)?;
+    assert!(updated.has_unread_attention());
+    assert!(fixture.notifier.requests.borrow().iter().any(|request| {
+        request.title.contains("feature-waiting") && request.body.contains("waiting for you")
+    }));
+    Ok(())
+}
+
+#[test]
+fn reconcile_workstream_output_activity_notifies_when_launch_goes_idle() -> anyhow::Result<()> {
+    let mut fixture = make_fixture()?;
+    let workstream = fixture.runtime.create_workstream(
+        fixture.repo_id,
+        WorkstreamRequest::New {
+            branch: "feature-idle".to_string(),
+            base_branch: "main".to_string(),
+        },
+        "codex",
+        LaunchMode::Stay,
+    )?;
+    let session_name = fixture
+        .runtime
+        .workstream_by_id(workstream.id)?
+        .preferred_session()
+        .map(|session| session.session_name.clone())
+        .expect("session");
+
+    fixture
+        .session_backend
+        .captured_lines
+        .borrow_mut()
+        .insert(session_name.clone(), vec!["agent is thinking".to_string()]);
+
+    fixture
+        .runtime
+        .reconcile_workstream_output_activity_at(100)?;
+    fixture
+        .runtime
+        .reconcile_workstream_output_activity_at(100 + 601)?;
+
+    let updated = fixture.runtime.workstream_by_id(workstream.id)?;
+    assert!(updated.has_unread_attention());
+    assert!(
+        updated
+            .attention_events
+            .iter()
+            .any(|event| { matches!(event.reason, AttentionReason::IdleOutput) && !event.seen })
+    );
+    assert!(fixture.notifier.requests.borrow().iter().any(|request| {
+        request.title.contains("feature-idle") && request.body.contains("No pane output")
+    }));
+
+    fixture
+        .session_backend
+        .captured_lines
+        .borrow_mut()
+        .insert(session_name, vec!["agent replied".to_string()]);
+    fixture
+        .runtime
+        .reconcile_workstream_output_activity_at(100 + 700)?;
+
+    let updated = fixture.runtime.workstream_by_id(workstream.id)?;
+    assert!(
+        updated
+            .attention_events
+            .iter()
+            .any(|event| { matches!(event.reason, AttentionReason::IdleOutput) && event.seen })
+    );
+    Ok(())
+}
+
+#[test]
 fn runtime_reconciles_persisted_background_completions_on_boot() -> anyhow::Result<()> {
     let fixture = make_fixture()?;
     let repo_id = fixture.repo_id;
@@ -488,8 +714,6 @@ fn runtime_reconciles_persisted_background_completions_on_boot() -> anyhow::Resu
         session_name: "mico-repo-feature-durable-codex-1-deadbeef".to_string(),
         agent_preset: "codex".to_string(),
         status: WorkstreamStatus::Running,
-        attention: WorkstreamAttention::None,
-        pinned: false,
         created_at_epoch_secs: 1,
         status_changed_at_epoch_secs: 1,
         last_opened_at_epoch_secs: None,
@@ -503,8 +727,12 @@ fn runtime_reconciles_persisted_background_completions_on_boot() -> anyhow::Resu
             status_changed_at_epoch_secs: 1,
             last_opened_at_epoch_secs: None,
             last_attached_at_epoch_secs: None,
+            last_output_at_epoch_secs: None,
+            last_output_digest: None,
+            last_idle_alert_at_epoch_secs: None,
         }],
         preferred_session_id: None,
+        attention_events: Vec::new(),
     };
     fixture
         .completion_store
@@ -527,6 +755,7 @@ fn runtime_reconciles_persisted_background_completions_on_boot() -> anyhow::Resu
             }),
             command_runner: Box::new(FakeCommandRunner::default()),
             operation_log: Box::new(fixture.operation_log.clone()),
+            notifier: Box::new(FakeNotifier::default()),
             completion_store: fixture.completion_store.clone(),
         },
         fixture.runtime.config.clone(),

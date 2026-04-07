@@ -56,10 +56,6 @@ pub struct Workstream {
     pub agent_preset: String,
     pub status: WorkstreamStatus,
     #[serde(default)]
-    pub attention: WorkstreamAttention,
-    #[serde(default)]
-    pub pinned: bool,
-    #[serde(default)]
     pub created_at_epoch_secs: u64,
     #[serde(default)]
     pub status_changed_at_epoch_secs: u64,
@@ -71,6 +67,8 @@ pub struct Workstream {
     pub sessions: Vec<WorkstreamSession>,
     #[serde(default)]
     pub preferred_session_id: Option<Uuid>,
+    #[serde(default)]
+    pub attention_events: Vec<AttentionEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +85,12 @@ pub struct WorkstreamSession {
     pub last_opened_at_epoch_secs: Option<u64>,
     #[serde(default)]
     pub last_attached_at_epoch_secs: Option<u64>,
+    #[serde(default)]
+    pub last_output_at_epoch_secs: Option<u64>,
+    #[serde(default)]
+    pub last_output_digest: Option<String>,
+    #[serde(default)]
+    pub last_idle_alert_at_epoch_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,19 +99,31 @@ pub enum WorkstreamRequest {
     Existing { branch: String },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-pub enum WorkstreamAttention {
-    #[default]
-    None,
-    ReviewNext,
-    Blocked,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkstreamStatus {
     Running,
     #[serde(alias = "Archived", alias = "archived")]
     Stopped,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AttentionReason {
+    TaskFailed,
+    OneOffCompleted,
+    SessionStopped,
+    BranchChanged,
+    IdleOutput,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionEvent {
+    pub reason: AttentionReason,
+    pub summary: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+    pub created_at_epoch_secs: u64,
+    #[serde(default)]
+    pub seen: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -162,6 +178,9 @@ impl Workstream {
                 status_changed_at_epoch_secs: self.status_changed_at_epoch_secs,
                 last_opened_at_epoch_secs: self.last_opened_at_epoch_secs,
                 last_attached_at_epoch_secs: self.last_attached_at_epoch_secs,
+                last_output_at_epoch_secs: None,
+                last_output_digest: None,
+                last_idle_alert_at_epoch_secs: None,
             });
         }
 
@@ -236,6 +255,84 @@ impl Workstream {
         self.sync_legacy_summary();
     }
 
+    pub fn unread_attention_count(&self) -> usize {
+        self.attention_events
+            .iter()
+            .filter(|event| !event.seen)
+            .count()
+    }
+
+    pub fn has_unread_attention(&self) -> bool {
+        self.attention_events.iter().any(|event| !event.seen)
+    }
+
+    pub fn latest_attention_event(&self) -> Option<&AttentionEvent> {
+        self.attention_events
+            .iter()
+            .max_by_key(|event| event.created_at_epoch_secs)
+    }
+
+    pub fn latest_unread_attention_event(&self) -> Option<&AttentionEvent> {
+        self.attention_events
+            .iter()
+            .filter(|event| !event.seen)
+            .max_by_key(|event| event.created_at_epoch_secs)
+    }
+
+    pub fn push_attention_event(
+        &mut self,
+        reason: AttentionReason,
+        summary: String,
+        detail: Option<String>,
+        seen: bool,
+    ) -> bool {
+        let created_at_epoch_secs = now_epoch_secs();
+        let duplicate = self.attention_events.iter().any(|event| {
+            event.reason == reason
+                && event.summary == summary
+                && event.detail == detail
+                && !event.seen
+        });
+        if duplicate {
+            return false;
+        }
+
+        self.attention_events.push(AttentionEvent {
+            reason,
+            summary,
+            detail,
+            created_at_epoch_secs,
+            seen,
+        });
+        if self.attention_events.len() > 12 {
+            let overflow = self.attention_events.len() - 12;
+            self.attention_events.drain(0..overflow);
+        }
+        true
+    }
+
+    pub fn mark_attention_seen(&mut self) -> bool {
+        let mut changed = false;
+        for event in &mut self.attention_events {
+            if !event.seen {
+                event.seen = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    pub fn mark_attention_reason_seen(&mut self, reason: AttentionReason) -> bool {
+        let mut changed = false;
+        for event in &mut self.attention_events {
+            if event.reason == reason && !event.seen {
+                event.seen = true;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     pub fn sync_legacy_summary(&mut self) {
         if let Some(session) = self.preferred_session().cloned() {
             self.session_name = session.session_name;
@@ -269,6 +366,13 @@ impl Workstream {
             .max()
             .unwrap_or(self.status_changed_at_epoch_secs);
     }
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
