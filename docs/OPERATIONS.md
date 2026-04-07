@@ -18,7 +18,7 @@ There is also a GitHub Releases bootstrap path through `install.sh`:
 curl -fsSL https://raw.githubusercontent.com/thegeorgejoseph/mico/main/install.sh | sh
 ```
 
-If `mico` was installed through Homebrew, `mico install` upgrades the Homebrew formula. If it was installed from GitHub Releases, `mico install` reinstalls from the latest GitHub release.
+If `mico` was installed through Homebrew, `mico install` runs a targeted Homebrew install/upgrade for the `mico` formula. If it was installed from GitHub Releases, `mico install` reinstalls from the latest GitHub release.
 
 The updater can use either:
 
@@ -46,7 +46,7 @@ That will:
 1. verify you are on `main`
 2. verify the working tree is clean
 3. bump the version in `Cargo.toml`
-4. regenerate `Cargo.lock`
+4. refresh workspace lockfile entries without broadly updating dependencies
 5. run format, check, and test
 6. create a release commit and tag
 7. push `main` and the tag

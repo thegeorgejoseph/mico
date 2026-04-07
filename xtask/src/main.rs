@@ -64,7 +64,7 @@ fn release(spec: &str) -> anyhow::Result<()> {
     println!("releasing mico {current} -> {next}");
     write_version(&cargo_manifest, &next)?;
 
-    run_checked(&root, "cargo", &["generate-lockfile"])?;
+    run_checked(&root, "cargo", &["update", "--workspace"])?;
     run_checked(&root, "cargo", &["fmt", "--all"])?;
     run_checked(&root, "cargo", &["check", "--workspace", "--all-targets"])?;
     run_checked(&root, "cargo", &["test", "--workspace", "--all-targets"])?;

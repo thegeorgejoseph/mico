@@ -904,7 +904,13 @@ impl DashboardApp {
                 workstream
                     .latest_unread_attention_event()
                     .or_else(|| workstream.latest_attention_event())
-                    .map(|event| format!("{selected_line}   signal {}", event.summary))
+                    .map(|event| {
+                        let suffix = match event.reason {
+                            AttentionReason::OneOffCompleted => "   press ! to review result",
+                            _ => "",
+                        };
+                        format!("{selected_line}   signal {}{suffix}", event.summary)
+                    })
             })
             .unwrap_or_else(|| selected_line.replace("workstream", "launch"));
         let block = Block::default()
@@ -949,53 +955,7 @@ impl DashboardApp {
             chunks[0],
         );
 
-        let mut inbox_entries = workstreams
-            .iter()
-            .filter_map(|workstream| {
-                workstream
-                    .latest_unread_attention_event()
-                    .map(|event| (workstream, event))
-            })
-            .collect::<Vec<_>>();
-        inbox_entries.sort_by(|(_, left), (_, right)| {
-            right
-                .created_at_epoch_secs
-                .cmp(&left.created_at_epoch_secs)
-                .then_with(|| left.summary.cmp(&right.summary))
-        });
-
-        let selected_attention_detail = self
-            .selected_workstream_id()
-            .and_then(|workstream_id| self.runtime.latest_attention_detail(workstream_id).ok())
-            .flatten();
-
-        let output_lines = if let Some(detail) = selected_attention_detail {
-            detail
-                .lines()
-                .map(|line| Line::styled(line.to_string(), Style::default().fg(LIVE_OUTPUT)))
-                .collect::<Vec<_>>()
-        } else if !inbox_entries.is_empty() {
-            inbox_entries
-                .into_iter()
-                .map(|(workstream, event)| {
-                    Line::from(vec![
-                        Span::styled(
-                            format!("[{}] ", attention_reason_label(&event.reason)),
-                            Style::default()
-                                .fg(attention_reason_color(&event.reason))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("{} ", workstream.branch),
-                            Style::default()
-                                .fg(Color::White)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(event.summary.clone(), Style::default().fg(MUTED_TEXT)),
-                    ])
-                })
-                .collect::<Vec<_>>()
-        } else if self.recent_output_lines.is_empty() {
+        let output_lines = if self.recent_output_lines.is_empty() {
             vec![Line::styled(
                 "live waiting for pane output",
                 Style::default().fg(LIVE_OUTPUT),

@@ -245,7 +245,7 @@ impl SystemUpdater {
 impl Updater for SystemUpdater {
     fn install_or_update(&self, github_repo: Option<&str>) -> anyhow::Result<()> {
         if Self::brew_available() && Self::brew_has_mico() {
-            return Self::run_checked("brew", &["upgrade", FORMULA_NAME]);
+            return Self::run_checked("brew", &["upgrade", "--formula", FORMULA_NAME]);
         }
 
         if let Some(repo) = Self::github_repo_slug(github_repo)? {
@@ -253,7 +253,7 @@ impl Updater for SystemUpdater {
         }
 
         if Self::brew_available() {
-            return Self::run_checked("brew", &["install", FORMULA_NAME]);
+            return Self::run_checked("brew", &["install", "--formula", FORMULA_NAME]);
         }
 
         bail!(
