@@ -3,6 +3,7 @@ use std::{
     path::Path,
     path::PathBuf,
     process::Command,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -10,9 +11,11 @@ use anyhow::{Context, bail};
 use uuid::Uuid;
 
 use crate::{
+    app::background::PersistedTaskResult,
     app::ports::{
         AgentOneOffRequest, CommandRunner, DependencyInspector, OperationLog, RepoService,
-        RuntimeStore, SessionBackend, SessionCreateRequest, SessionLabel, TerminalFrontend,
+        RuntimeStore, SessionBackend, SessionCreateRequest, SessionLabel, TaskCompletionStore,
+        TerminalFrontend,
     },
     domain::model::{
         AppConfig, AppPaths, DoctorReport, OperationEvent, OperationLevel, RepoTarget, StoredState,
@@ -22,7 +25,7 @@ use crate::{
     infra::{
         config::default_agent_presets, deps::SystemDependencyInspector, git::GitCliRepoService,
         iterm::ITermFrontend, json_store::JsonFileStore, operations::JsonlOperationLog,
-        process::ShellCommandRunner, tmux::TmuxSessionBackend,
+        process::ShellCommandRunner, task_store::JsonTaskCompletionStore, tmux::TmuxSessionBackend,
     },
 };
 
@@ -31,6 +34,17 @@ pub enum LaunchMode {
     Stay,
     Open,
     Attach,
+}
+
+pub struct RuntimeInterfaces {
+    pub store: Box<dyn RuntimeStore>,
+    pub repo_service: Box<dyn RepoService>,
+    pub session_backend: Box<dyn SessionBackend>,
+    pub terminal: Box<dyn TerminalFrontend>,
+    pub dependency_inspector: Box<dyn DependencyInspector>,
+    pub command_runner: Box<dyn CommandRunner>,
+    pub operation_log: Box<dyn OperationLog>,
+    pub completion_store: Arc<dyn TaskCompletionStore + Send + Sync>,
 }
 
 pub struct MicoRuntime {
@@ -42,6 +56,7 @@ pub struct MicoRuntime {
     dependency_inspector: Box<dyn DependencyInspector>,
     command_runner: Box<dyn CommandRunner>,
     operation_log: Box<dyn OperationLog>,
+    completion_store: Arc<dyn TaskCompletionStore + Send + Sync>,
     pub config: AppConfig,
     pub state: StoredState,
     pub report: DoctorReport,
@@ -56,15 +71,21 @@ impl MicoRuntime {
     ) -> anyhow::Result<Self> {
         let dependency_paths = paths.clone();
         let operations_log_path = paths.operations_log_path.clone();
+        let completion_store: Arc<dyn TaskCompletionStore + Send + Sync> = Arc::new(
+            JsonTaskCompletionStore::new(paths.task_results_path.clone()),
+        );
         Self::with_interfaces(
             paths,
-            Box::new(store),
-            Box::new(GitCliRepoService::new()),
-            Box::new(TmuxSessionBackend::new()),
-            Box::new(ITermFrontend::new()),
-            Box::new(SystemDependencyInspector::new(dependency_paths)),
-            Box::new(ShellCommandRunner::new()),
-            Box::new(JsonlOperationLog::new(operations_log_path)),
+            RuntimeInterfaces {
+                store: Box::new(store),
+                repo_service: Box::new(GitCliRepoService::new()),
+                session_backend: Box::new(TmuxSessionBackend::new()),
+                terminal: Box::new(ITermFrontend::new()),
+                dependency_inspector: Box::new(SystemDependencyInspector::new(dependency_paths)),
+                command_runner: Box::new(ShellCommandRunner::new()),
+                operation_log: Box::new(JsonlOperationLog::new(operations_log_path)),
+                completion_store,
+            },
             config,
             state,
         )
@@ -72,33 +93,29 @@ impl MicoRuntime {
 
     pub fn with_interfaces(
         paths: AppPaths,
-        store: Box<dyn RuntimeStore>,
-        repo_service: Box<dyn RepoService>,
-        session_backend: Box<dyn SessionBackend>,
-        terminal: Box<dyn TerminalFrontend>,
-        dependency_inspector: Box<dyn DependencyInspector>,
-        command_runner: Box<dyn CommandRunner>,
-        operation_log: Box<dyn OperationLog>,
+        interfaces: RuntimeInterfaces,
         config: AppConfig,
         state: StoredState,
     ) -> anyhow::Result<Self> {
-        let report = dependency_inspector.doctor()?;
+        let report = interfaces.dependency_inspector.doctor()?;
 
         let mut runtime = Self {
             paths,
-            store,
-            repo_service,
-            session_backend,
-            terminal,
-            dependency_inspector,
-            command_runner,
-            operation_log,
+            store: interfaces.store,
+            repo_service: interfaces.repo_service,
+            session_backend: interfaces.session_backend,
+            terminal: interfaces.terminal,
+            dependency_inspector: interfaces.dependency_inspector,
+            command_runner: interfaces.command_runner,
+            operation_log: interfaces.operation_log,
+            completion_store: interfaces.completion_store,
             config,
             state,
             report,
         };
 
         runtime.hydrate_agent_presets()?;
+        runtime.reconcile_background_completions()?;
         runtime.hydrate_workstream_metadata()?;
         runtime.reconcile_workstream_branches()?;
         runtime.reconcile_workstream_sessions()?;
@@ -109,6 +126,18 @@ impl MicoRuntime {
         self.report = self.dependency_inspector.doctor()?;
         self.reconcile_workstream_branches()?;
         Ok(())
+    }
+
+    pub fn paths(&self) -> &AppPaths {
+        &self.paths
+    }
+
+    pub fn config_snapshot(&self) -> AppConfig {
+        self.config.clone()
+    }
+
+    pub fn completion_store(&self) -> Arc<dyn TaskCompletionStore + Send + Sync> {
+        Arc::clone(&self.completion_store)
     }
 
     pub fn refresh_repo(&mut self, repo_id: Uuid) -> anyhow::Result<()> {
@@ -530,6 +559,136 @@ impl MicoRuntime {
         Ok(self.workstream_by_id(workstream_id)?.sessions.clone())
     }
 
+    pub fn apply_branch_updates(
+        &mut self,
+        branch_updates: Vec<(Uuid, String)>,
+    ) -> anyhow::Result<()> {
+        let mut changed = false;
+        for (workstream_id, branch) in branch_updates {
+            let Ok(target) = self.workstream_by_id_mut(workstream_id) else {
+                continue;
+            };
+            if target.branch != branch {
+                target.branch = branch;
+                changed = true;
+            }
+        }
+        if changed {
+            self.save_state()?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_created_workstream(&mut self, workstream: Workstream) -> anyhow::Result<()> {
+        if self
+            .state
+            .workstreams
+            .iter()
+            .any(|existing| existing.id == workstream.id)
+        {
+            return Ok(());
+        }
+        self.state.workstreams.push(workstream);
+        self.save_state()
+    }
+
+    pub fn apply_created_workstream_session(
+        &mut self,
+        workstream_id: Uuid,
+        session: WorkstreamSession,
+    ) -> anyhow::Result<()> {
+        let target = self.workstream_by_id_mut(workstream_id)?;
+        if target.session_by_id(session.id).is_none() {
+            target.add_session(session, true);
+            self.save_state()?;
+        }
+        Ok(())
+    }
+
+    pub fn apply_resumed_workstream_session(
+        &mut self,
+        workstream_id: Uuid,
+        session_id: Uuid,
+    ) -> anyhow::Result<()> {
+        let target = self.workstream_by_id_mut(workstream_id)?;
+        if let Some(session) = target.session_by_id_mut(session_id) {
+            session.status = WorkstreamStatus::Running;
+            session.status_changed_at_epoch_secs = now_epoch_secs();
+        }
+        target.preferred_session_id = Some(session_id);
+        target.sync_legacy_summary();
+        self.save_state()
+    }
+
+    pub fn apply_stopped_workstream(&mut self, workstream_id: Uuid) -> anyhow::Result<String> {
+        let branch = {
+            let target = self.workstream_by_id_mut(workstream_id)?;
+            for session in &mut target.sessions {
+                session.status = WorkstreamStatus::Stopped;
+                session.status_changed_at_epoch_secs = now_epoch_secs();
+            }
+            target.sync_legacy_summary();
+            target.branch.clone()
+        };
+        self.save_state()?;
+        Ok(branch)
+    }
+
+    pub fn apply_removed_workstream(&mut self, workstream_id: Uuid) -> anyhow::Result<String> {
+        let branch = self.workstream_by_id(workstream_id)?.branch.clone();
+        self.state
+            .workstreams
+            .retain(|candidate| candidate.id != workstream_id);
+        self.save_state()?;
+        Ok(branch)
+    }
+
+    pub fn apply_persisted_completion(
+        &mut self,
+        result: PersistedTaskResult,
+    ) -> anyhow::Result<()> {
+        match result {
+            PersistedTaskResult::RepoRefreshed { branch_updates, .. } => {
+                self.apply_branch_updates(branch_updates)
+            }
+            PersistedTaskResult::WorkstreamCreated { workstream } => {
+                self.apply_created_workstream(workstream)
+            }
+            PersistedTaskResult::WorkstreamSessionCreated {
+                workstream_id,
+                session,
+            } => {
+                if self.workstream_by_id(workstream_id).is_ok() {
+                    self.apply_created_workstream_session(workstream_id, session)?;
+                }
+                Ok(())
+            }
+            PersistedTaskResult::WorkstreamSessionResumed {
+                workstream_id,
+                session_id,
+            } => {
+                if let Ok(workstream) = self.workstream_by_id(workstream_id)
+                    && workstream.session_by_id(session_id).is_some()
+                {
+                    self.apply_resumed_workstream_session(workstream_id, session_id)?;
+                }
+                Ok(())
+            }
+            PersistedTaskResult::WorkstreamStopped { workstream_id } => {
+                if self.workstream_by_id(workstream_id).is_ok() {
+                    let _ = self.apply_stopped_workstream(workstream_id)?;
+                }
+                Ok(())
+            }
+            PersistedTaskResult::WorkstreamRemoved { workstream_id } => {
+                if self.workstream_by_id(workstream_id).is_ok() {
+                    let _ = self.apply_removed_workstream(workstream_id)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn preferred_session_id(&self, workstream_id: Uuid) -> anyhow::Result<Uuid> {
         self.workstream_by_id(workstream_id)?
             .preferred_session()
@@ -854,6 +1013,26 @@ impl MicoRuntime {
         Ok(())
     }
 
+    fn reconcile_background_completions(&mut self) -> anyhow::Result<()> {
+        let completions = self.completion_store.load()?;
+        for completion in completions {
+            match self.apply_persisted_completion(completion.result.clone()) {
+                Ok(()) => {
+                    self.completion_store.remove(completion.id)?;
+                }
+                Err(error) => {
+                    self.record_operation(
+                        OperationLevel::Warning,
+                        "runtime",
+                        "background.completion.reconcile",
+                        format!("failed to apply completion {}: {error}", completion.id),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn save_state(&self) -> anyhow::Result<()> {
         self.store.save_state(&self.state)
     }
@@ -1144,443 +1323,4 @@ fn open_in_vscode(path: &std::path::Path) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use std::{cell::RefCell, collections::HashMap, fs, rc::Rc};
-
-    use crate::{
-        app::ports::{AgentOneOffResult, ConfigStore, StateStore},
-        domain::model::{AgentPreset, DependencyStatus, OperationEvent, WorktreePlan},
-        infra::config::default_state,
-    };
-    use tempfile::TempDir;
-
-    #[derive(Clone, Default)]
-    struct FakeStore {
-        saved_state: Rc<RefCell<Option<StoredState>>>,
-        saved_config: Rc<RefCell<Option<AppConfig>>>,
-    }
-
-    impl ConfigStore for FakeStore {
-        fn load_or_create_config(&self, default: AppConfig) -> anyhow::Result<AppConfig> {
-            Ok(default)
-        }
-
-        fn save_config(&self, config: &AppConfig) -> anyhow::Result<()> {
-            *self.saved_config.borrow_mut() = Some(config.clone());
-            Ok(())
-        }
-    }
-
-    impl StateStore for FakeStore {
-        fn load_or_create_state(&self, default: StoredState) -> anyhow::Result<StoredState> {
-            Ok(default)
-        }
-
-        fn save_state(&self, state: &StoredState) -> anyhow::Result<()> {
-            *self.saved_state.borrow_mut() = Some(state.clone());
-            Ok(())
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeRepoService {
-        fetch_error: Rc<RefCell<Option<String>>>,
-        branches: Rc<RefCell<Vec<String>>>,
-        push_target_calls: Rc<RefCell<Vec<(PathBuf, String, String)>>>,
-    }
-
-    impl Default for FakeRepoService {
-        fn default() -> Self {
-            Self {
-                fetch_error: Rc::new(RefCell::new(None)),
-                branches: Rc::new(RefCell::new(vec!["main".to_string()])),
-                push_target_calls: Rc::new(RefCell::new(Vec::new())),
-            }
-        }
-    }
-
-    impl RepoService for FakeRepoService {
-        fn discover_repo(
-            &self,
-            path: &Path,
-            display_name: Option<&str>,
-        ) -> anyhow::Result<RepoTarget> {
-            Ok(RepoTarget {
-                id: Uuid::new_v4(),
-                path: path.to_path_buf(),
-                display_name: display_name.unwrap_or("repo").to_string(),
-                slug: "repo".to_string(),
-            })
-        }
-
-        fn current_branch(&self, path: &Path) -> anyhow::Result<Option<String>> {
-            let branch_path = path.join(".branch");
-            if branch_path.exists() {
-                Ok(Some(fs::read_to_string(branch_path)?.trim().to_string()))
-            } else {
-                Ok(None)
-            }
-        }
-
-        fn list_branches(&self, _repo: &RepoTarget) -> anyhow::Result<Vec<String>> {
-            Ok(self.branches.borrow().clone())
-        }
-
-        fn default_remote(&self, _repo: &RepoTarget) -> anyhow::Result<String> {
-            Ok("origin".to_string())
-        }
-
-        fn fetch_latest(&self, _repo: &RepoTarget) -> anyhow::Result<()> {
-            if let Some(message) = self.fetch_error.borrow().clone() {
-                bail!(message)
-            }
-            Ok(())
-        }
-
-        fn plan_new_worktree(
-            &self,
-            _repo: &RepoTarget,
-            worktrees_root: &Path,
-            branch: &str,
-            base_branch: &str,
-        ) -> anyhow::Result<WorktreePlan> {
-            Ok(WorktreePlan {
-                branch: branch.to_string(),
-                worktree_path: worktrees_root.join(branch),
-                worktree_ownership: WorktreeOwnership::Managed,
-                checkout: crate::domain::model::WorktreeCheckout::NewBranch {
-                    base_ref: format!("origin/{base_branch}"),
-                },
-            })
-        }
-
-        fn plan_existing_worktree(
-            &self,
-            _repo: &RepoTarget,
-            worktrees_root: &Path,
-            branch: &str,
-        ) -> anyhow::Result<WorktreePlan> {
-            Ok(WorktreePlan {
-                branch: branch.to_string(),
-                worktree_path: worktrees_root.join(branch),
-                worktree_ownership: WorktreeOwnership::Managed,
-                checkout: crate::domain::model::WorktreeCheckout::ExistingBranch {
-                    start_ref: Some(format!("origin/{branch}")),
-                },
-            })
-        }
-
-        fn create_worktree(&self, _repo: &RepoTarget, plan: &WorktreePlan) -> anyhow::Result<()> {
-            fs::create_dir_all(&plan.worktree_path)?;
-            fs::write(plan.worktree_path.join(".branch"), &plan.branch)?;
-            Ok(())
-        }
-
-        fn configure_push_target(
-            &self,
-            worktree_path: &Path,
-            branch: &str,
-            remote: &str,
-        ) -> anyhow::Result<()> {
-            self.push_target_calls.borrow_mut().push((
-                worktree_path.to_path_buf(),
-                branch.to_string(),
-                remote.to_string(),
-            ));
-            Ok(())
-        }
-
-        fn remove_worktree(&self, _repo: &RepoTarget, worktree_path: &Path) -> anyhow::Result<()> {
-            if worktree_path.exists() {
-                fs::remove_dir_all(worktree_path)?;
-            }
-            Ok(())
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct FakeSessionBackend {
-        sessions: Rc<RefCell<HashMap<String, SessionCreateRequest>>>,
-    }
-
-    impl SessionBackend for FakeSessionBackend {
-        fn create_session(&self, request: &SessionCreateRequest) -> anyhow::Result<()> {
-            self.sessions
-                .borrow_mut()
-                .insert(request.session_name.clone(), request.clone());
-            Ok(())
-        }
-
-        fn sync_session(&self, request: &SessionCreateRequest) -> anyhow::Result<()> {
-            self.sessions
-                .borrow_mut()
-                .insert(request.session_name.clone(), request.clone());
-            Ok(())
-        }
-
-        fn has_session(&self, session_name: &str) -> bool {
-            self.sessions.borrow().contains_key(session_name)
-        }
-
-        fn attach(&self, _session_name: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-
-        fn stop(&self, session_name: &str) -> anyhow::Result<()> {
-            self.sessions.borrow_mut().remove(session_name);
-            Ok(())
-        }
-
-        fn attach_command(&self, session_name: &str) -> Vec<String> {
-            vec![
-                "tmux".to_string(),
-                "attach".to_string(),
-                "-t".to_string(),
-                session_name.to_string(),
-            ]
-        }
-
-        fn capture_recent_lines(
-            &self,
-            session_name: &str,
-            _lines: usize,
-        ) -> anyhow::Result<Vec<String>> {
-            Ok(vec![format!("output from {session_name}")])
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct FakeTerminalFrontend;
-
-    impl TerminalFrontend for FakeTerminalFrontend {
-        fn open_session(
-            &self,
-            _session_name: &str,
-            _attach_command: &[String],
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeDependencyInspector {
-        paths: AppPaths,
-    }
-
-    impl DependencyInspector for FakeDependencyInspector {
-        fn doctor(&self) -> anyhow::Result<DoctorReport> {
-            Ok(DoctorReport {
-                paths: self.paths.clone(),
-                dependencies: vec![DependencyStatus {
-                    name: "git".to_string(),
-                    found: true,
-                    detail: "ok".to_string(),
-                }],
-            })
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct FakeCommandRunner {
-        last_request: Rc<RefCell<Option<AgentOneOffRequest>>>,
-    }
-
-    impl CommandRunner for FakeCommandRunner {
-        fn run_agent_one_off(
-            &self,
-            request: &AgentOneOffRequest,
-        ) -> anyhow::Result<AgentOneOffResult> {
-            *self.last_request.borrow_mut() = Some(request.clone());
-            Ok(AgentOneOffResult {
-                stdout: "done".to_string(),
-                stderr: String::new(),
-            })
-        }
-    }
-
-    #[derive(Clone, Default)]
-    struct FakeOperationLog {
-        events: Rc<RefCell<Vec<OperationEvent>>>,
-    }
-
-    impl OperationLog for FakeOperationLog {
-        fn record(&self, event: &OperationEvent) -> anyhow::Result<()> {
-            self.events.borrow_mut().push(event.clone());
-            Ok(())
-        }
-
-        fn recent(&self, limit: usize) -> anyhow::Result<Vec<OperationEvent>> {
-            let events = self.events.borrow();
-            let start = events.len().saturating_sub(limit);
-            Ok(events[start..].to_vec())
-        }
-    }
-
-    struct RuntimeFixture {
-        _temp: TempDir,
-        runtime: MicoRuntime,
-        repo_id: Uuid,
-        repo_service: FakeRepoService,
-        operation_log: FakeOperationLog,
-    }
-
-    fn make_fixture() -> anyhow::Result<RuntimeFixture> {
-        let temp = TempDir::new()?;
-        let paths = AppPaths {
-            root: temp.path().join(".mico"),
-            config_path: temp.path().join(".mico/config.json"),
-            state_path: temp.path().join(".mico/state.json"),
-            operations_log_path: temp.path().join(".mico/operations.jsonl"),
-            worktrees_root: temp.path().join(".mico/worktrees"),
-        };
-        fs::create_dir_all(&paths.worktrees_root)?;
-
-        let repo_path = temp.path().join("repo");
-        fs::create_dir_all(&repo_path)?;
-        let repo = RepoTarget {
-            id: Uuid::new_v4(),
-            path: repo_path,
-            display_name: "Repo".to_string(),
-            slug: "repo".to_string(),
-        };
-
-        let repo_service = FakeRepoService::default();
-        let operation_log = FakeOperationLog::default();
-        let config = AppConfig {
-            github_repo: None,
-            agent_presets: vec![
-                AgentPreset {
-                    name: "terminal".to_string(),
-                    command: String::new(),
-                    one_off_command: None,
-                },
-                AgentPreset {
-                    name: "codex".to_string(),
-                    command: "codex".to_string(),
-                    one_off_command: Some("codex exec {prompt}".to_string()),
-                },
-                AgentPreset {
-                    name: "opencode".to_string(),
-                    command: "opencode".to_string(),
-                    one_off_command: Some("opencode run {prompt}".to_string()),
-                },
-            ],
-        };
-        let mut state = default_state();
-        state.repos.push(repo.clone());
-
-        let runtime = MicoRuntime::with_interfaces(
-            paths.clone(),
-            Box::new(FakeStore::default()),
-            Box::new(repo_service.clone()),
-            Box::new(FakeSessionBackend::default()),
-            Box::new(FakeTerminalFrontend),
-            Box::new(FakeDependencyInspector { paths }),
-            Box::new(FakeCommandRunner::default()),
-            Box::new(operation_log.clone()),
-            config,
-            state,
-        )?;
-
-        Ok(RuntimeFixture {
-            _temp: temp,
-            runtime,
-            repo_id: repo.id,
-            repo_service,
-            operation_log,
-        })
-    }
-
-    #[test]
-    fn branches_for_repo_uses_cached_refs_when_fetch_fails() -> anyhow::Result<()> {
-        let mut fixture = make_fixture()?;
-        *fixture.repo_service.fetch_error.borrow_mut() = Some("prune failed".to_string());
-
-        let branches = fixture.runtime.branches_for_repo(fixture.repo_id)?;
-
-        assert_eq!(branches, vec!["main".to_string()]);
-        assert!(
-            fixture
-                .operation_log
-                .events
-                .borrow()
-                .iter()
-                .any(|event| matches!(event.level, OperationLevel::Warning))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn create_workstream_configures_push_target_for_new_branches() -> anyhow::Result<()> {
-        let mut fixture = make_fixture()?;
-
-        fixture.runtime.create_workstream(
-            fixture.repo_id,
-            WorkstreamRequest::New {
-                branch: "feature-a".to_string(),
-                base_branch: "main".to_string(),
-            },
-            "codex",
-            LaunchMode::Stay,
-        )?;
-
-        assert_eq!(fixture.repo_service.push_target_calls.borrow().len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn create_workstream_session_adds_a_second_preferred_session() -> anyhow::Result<()> {
-        let mut fixture = make_fixture()?;
-        let workstream = fixture.runtime.create_workstream(
-            fixture.repo_id,
-            WorkstreamRequest::New {
-                branch: "feature-b".to_string(),
-                base_branch: "main".to_string(),
-            },
-            "codex",
-            LaunchMode::Stay,
-        )?;
-
-        let session = fixture.runtime.create_workstream_session(
-            workstream.id,
-            "opencode",
-            LaunchMode::Stay,
-        )?;
-        let updated = fixture.runtime.workstream_by_id(workstream.id)?;
-
-        assert_eq!(updated.session_count(), 2);
-        assert_eq!(updated.preferred_session_id, Some(session.id));
-        assert_eq!(
-            updated
-                .preferred_session()
-                .map(|entry| entry.agent_preset.as_str()),
-            Some("opencode")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn run_workstream_one_off_uses_selected_agent_template() -> anyhow::Result<()> {
-        let mut fixture = make_fixture()?;
-        let workstream = fixture.runtime.create_workstream(
-            fixture.repo_id,
-            WorkstreamRequest::New {
-                branch: "feature-c".to_string(),
-                base_branch: "main".to_string(),
-            },
-            "codex",
-            LaunchMode::Stay,
-        )?;
-
-        let output = fixture.runtime.run_workstream_one_off(
-            workstream.id,
-            "opencode",
-            "summarize the branch",
-        )?;
-
-        assert_eq!(output, "done");
-        Ok(())
-    }
-}
+mod tests;

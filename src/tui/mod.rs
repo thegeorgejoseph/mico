@@ -1,5 +1,6 @@
 use std::{
     cmp::Ordering,
+    collections::VecDeque,
     io::{self, Stdout},
     path::PathBuf,
     process::Command,
@@ -22,7 +23,13 @@ use ratatui::{
 use uuid::Uuid;
 
 use crate::{
-    app::runtime::{LaunchMode, MicoRuntime},
+    app::{
+        background::{
+            BackgroundTaskManager, SessionLaunchTarget, TaskLock, TaskRequest, TaskSuccess,
+            TrackedWorkstreamPath,
+        },
+        runtime::{LaunchMode, MicoRuntime},
+    },
     domain::model::{
         Workstream, WorkstreamAttention, WorkstreamRequest, WorkstreamSession, WorkstreamStatus,
     },
@@ -62,6 +69,10 @@ fn dashboard_loop(
     app: &mut DashboardApp,
 ) -> anyhow::Result<()> {
     loop {
+        app.poll_background_tasks();
+        app.background_tasks
+            .refresh_config(app.runtime.config_snapshot());
+        app.process_deferred_actions(terminal)?;
         terminal.draw(|frame| app.render(frame))?;
 
         if event::poll(Duration::from_millis(250))?
@@ -123,8 +134,8 @@ enum FocusPane {
 impl FocusPane {
     fn label(self) -> &'static str {
         match self {
-            Self::Repos => "repos",
-            Self::Workstreams => "workstreams",
+            Self::Repos => "missions",
+            Self::Workstreams => "launches",
         }
     }
 }
@@ -133,6 +144,12 @@ impl FocusPane {
 enum DashboardAction {
     None,
     Quit,
+    Attach(Uuid, Uuid),
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeferredAction {
+    Open(Uuid, Uuid),
     Attach(Uuid, Uuid),
 }
 
@@ -255,63 +272,63 @@ struct PaletteEntry {
 const PALETTE_ENTRIES: [PaletteEntry; 13] = [
     PaletteEntry {
         command: PaletteCommand::AddRepo,
-        title: "Add repo",
+        title: "Add mission",
         detail: "Track another repository from a filesystem path.",
     },
     PaletteEntry {
         command: PaletteCommand::CreateWorkstream,
-        title: "Create workstream",
-        detail: "Use the selected repo to create a new or existing branch worktree.",
+        title: "Create launch",
+        detail: "Use the selected mission to create a new or existing branch worktree.",
     },
     PaletteEntry {
         command: PaletteCommand::LaunchWorkstreamSession,
         title: "Launch another session",
-        detail: "Start an additional claude, codex, opencode, or terminal session in the selected workstream.",
+        detail: "Start an additional claude, codex, opencode, or terminal session in the selected launch.",
     },
     PaletteEntry {
         command: PaletteCommand::RunWorkstreamOneOff,
         title: "Run one-off agent command",
-        detail: "Open a drawer for a non-interactive agent run in the selected workstream.",
+        detail: "Open a drawer for a non-interactive agent run in the selected launch.",
     },
     PaletteEntry {
         command: PaletteCommand::OpenInVscode,
         title: "Open selection in VS Code",
-        detail: "Open the selected repo or workstream directory with `code`.",
+        detail: "Open the selected mission or launch directory with `code`.",
     },
     PaletteEntry {
         command: PaletteCommand::RefreshRepo,
-        title: "Refresh selected repo",
+        title: "Refresh selected mission",
         detail: "Fetch the latest refs for the selected repository.",
     },
     PaletteEntry {
         command: PaletteCommand::RemoveRepo,
-        title: "Remove selected repo",
-        detail: "Untrack the selected repository after its workstreams are gone.",
+        title: "Remove selected mission",
+        detail: "Untrack the selected mission after its launches are gone.",
     },
     PaletteEntry {
         command: PaletteCommand::OpenWorkstream,
-        title: "Open selected workstream",
+        title: "Open selected launch",
         detail: "Open it in this terminal. Detach with Ctrl-b d to return to mico.",
     },
     PaletteEntry {
         command: PaletteCommand::AttachWorkstream,
-        title: "Open selected workstream in new tab",
-        detail: "Open the selected workstream in a new iTerm tab.",
+        title: "Open selected launch in new tab",
+        detail: "Open the selected launch in a new iTerm tab.",
     },
     PaletteEntry {
         command: PaletteCommand::ResumeWorkstream,
-        title: "Resume selected workstream",
+        title: "Resume selected launch",
         detail: "Recreate a tmux session in the saved worktree and mark it running again.",
     },
     PaletteEntry {
         command: PaletteCommand::StopWorkstream,
-        title: "Stop selected workstream",
+        title: "Stop selected launch",
         detail: "Kill the tmux session but keep the worktree and local record.",
     },
     PaletteEntry {
         command: PaletteCommand::RemoveWorkstream,
-        title: "Remove selected workstream",
-        detail: "Remove the selected workstream. Managed worktrees are deleted; linked checkouts are untracked.",
+        title: "Remove selected launch",
+        detail: "Remove the selected launch. Managed worktrees are deleted; linked checkouts are untracked.",
     },
     PaletteEntry {
         command: PaletteCommand::RefreshDoctor,
@@ -478,11 +495,18 @@ struct DashboardApp {
     recent_output_workstream_id: Option<Uuid>,
     recent_output_lines: Vec<String>,
     last_output_refresh: Option<Instant>,
+    background_tasks: BackgroundTaskManager,
+    deferred_actions: VecDeque<DeferredAction>,
 }
 
 impl DashboardApp {
     fn new(mut runtime: MicoRuntime) -> Self {
         let _ = runtime.refresh_doctor();
+        let background_tasks = BackgroundTaskManager::new(
+            runtime.paths().clone(),
+            runtime.config_snapshot(),
+            runtime.completion_store(),
+        );
         let mut repo_state = ListState::default();
         let mut workstream_state = ListState::default();
 
@@ -512,6 +536,8 @@ impl DashboardApp {
             recent_output_workstream_id: None,
             recent_output_lines: Vec::new(),
             last_output_refresh: None,
+            background_tasks,
+            deferred_actions: VecDeque::new(),
         }
     }
 
@@ -623,7 +649,7 @@ impl DashboardApp {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-            Line::from("Fast path: add a repo, hit Enter, pick a branch, launch an agent."),
+            Line::from("Fast path: add a mission, hit Enter, pick a branch, launch an agent."),
             Line::from(
                 "tmux sessions keep running when you quit the dashboard; mico is just the control plane.",
             ),
@@ -640,24 +666,27 @@ impl DashboardApp {
     fn render_body(&mut self, frame: &mut Frame<'_>, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
             .split(area);
 
         let repo_items: Vec<ListItem<'_>> = if self.runtime.state.repos.is_empty() {
-            vec![ListItem::new(
-                "No repos tracked yet. Press : and choose Add repo.",
-            )]
+            vec![ListItem::new("No missions tracked yet. Press : and choose Add mission.")]
         } else {
             self.runtime
                 .state
                 .repos
                 .iter()
                 .map(|repo| {
+                    let mut header = vec![Span::styled(
+                        repo.display_name.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )];
+                    if self.background_tasks.is_repo_mutating(repo.id) {
+                        header.push(Span::raw(" "));
+                        header.push(label_chip("BUSY", WARNING_AMBER));
+                    }
                     ListItem::new(vec![
-                        Line::styled(
-                            repo.display_name.clone(),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
+                        Line::from(header),
                         Line::from(repo.path.display().to_string()),
                     ])
                 })
@@ -666,7 +695,7 @@ impl DashboardApp {
 
         let repo_block = Block::default()
             .borders(Borders::ALL)
-            .title("Repos")
+            .title("Missions")
             .border_style(if self.focus == FocusPane::Repos {
                 Style::default().fg(Color::Cyan)
             } else {
@@ -693,9 +722,9 @@ impl DashboardApp {
         let workstream_items: Vec<ListItem<'_>> = if visible_workstream_ids.is_empty() {
             vec![ListItem::new(match self.workstream_view {
                 WorkstreamView::All => {
-                    "No workstreams yet. Select a repo, open the palette, and create one."
+                    "No launches yet. Select a mission, open the palette, and create one."
                 }
-                _ => "No workstreams matched the current view.",
+                _ => "No launches matched the current view.",
             })]
         } else {
             visible_workstream_ids
@@ -720,6 +749,10 @@ impl DashboardApp {
                             .fg(Color::White)
                             .add_modifier(Modifier::BOLD),
                     )];
+                    if self.background_tasks.is_workstream_locked(workstream.id) {
+                        header.push(Span::raw(" "));
+                        header.push(label_chip("BUSY", WARNING_AMBER));
+                    }
                     for chip in workstream_chips(workstream) {
                         header.push(Span::raw(" "));
                         header.push(chip);
@@ -802,7 +835,7 @@ impl DashboardApp {
         };
 
         let workstream_title = format!(
-            "Workstreams  view:{}  sort:{}{}",
+            "Launches  view:{}  sort:{}{}",
             self.workstream_view.label(),
             self.workstream_sort.label(),
             if self.workstream_filter.trim().is_empty() {
@@ -881,6 +914,7 @@ impl DashboardApp {
                 )
             })
             .unwrap_or_else(|| "select a workstream to inspect its current signal.".to_string());
+        let selected_line = selected_line.replace("workstream", "launch");
         let block = Block::default().borders(Borders::ALL).title("Pulse");
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -902,7 +936,7 @@ impl DashboardApp {
         let summary_lines = if workstreams.is_empty() {
             vec![
                 Line::styled(
-                    "No workstreams in this view yet.",
+                    "No launches in this view yet.",
                     Style::default().fg(MUTED_TEXT),
                 ),
                 Line::from(""),
@@ -982,15 +1016,19 @@ impl DashboardApp {
             }
             1 => {
                 pairs.push((
-                    "repos".to_string(),
+                    "missions".to_string(),
                     self.runtime.state.repos.len().to_string(),
                 ));
                 pairs.push((
-                    "workstreams".to_string(),
+                    "launches".to_string(),
                     self.runtime.state.workstreams.len().to_string(),
                 ));
                 pairs.push(("running".to_string(), running_count.to_string()));
                 pairs.push(("attention".to_string(), attention_count.to_string()));
+                pairs.push((
+                    "jobs".to_string(),
+                    self.background_tasks.active_tasks().len().to_string(),
+                ));
             }
             2 => {
                 if let Some(workstream) = self.selected_workstream() {
@@ -1036,7 +1074,7 @@ impl DashboardApp {
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect) {
         let selected_repo = self.selected_repo().map(|repo| {
             format!(
-                "selected repo: {}  ({})",
+                "selected mission: {}  ({})",
                 repo.display_name,
                 repo.path.display()
             )
@@ -1047,7 +1085,7 @@ impl DashboardApp {
                 .map(|session| format!("{} ({})", session.agent_preset, session.session_name))
                 .unwrap_or_else(|| "no session".to_string());
             format!(
-                "selected workstream: {}  -> {}  [{}]",
+                "selected launch: {}  -> {}  [{}]",
                 workstream.branch,
                 workstream.worktree_path.display(),
                 session_summary
@@ -1059,7 +1097,7 @@ impl DashboardApp {
         });
         let context_line = match self.focus {
             FocusPane::Repos => line_from_pairs(&[
-                ("Enter", "create workstream"),
+                ("Enter", "create launch"),
                 ("v", "open in code"),
                 (":", "commands"),
             ]),
@@ -1085,16 +1123,25 @@ impl DashboardApp {
             ("q q", "quit dashboard"),
             (":", "command palette"),
         ]);
+        let jobs_line = if self.background_tasks.active_tasks().is_empty() {
+            Line::from("jobs: none")
+        } else {
+            Line::from(format!(
+                "jobs: {}",
+                self.background_tasks.active_labels().join("  |  ")
+            ))
+        };
 
         let info = Paragraph::new(Text::from(vec![
             Line::styled(
                 format!("status: {}", status.text),
                 status_style(status.tone),
             ),
-            Line::from(selected_repo.unwrap_or_else(|| "selected repo: none".to_string())),
+            Line::from(selected_repo.unwrap_or_else(|| "selected mission: none".to_string())),
             Line::from(
-                selected_workstream.unwrap_or_else(|| "selected workstream: none".to_string()),
+                selected_workstream.unwrap_or_else(|| "selected launch: none".to_string()),
             ),
+            jobs_line,
             context_line,
             global_line,
         ]))
@@ -1200,7 +1247,7 @@ impl DashboardApp {
             .split(area);
 
         let help = Paragraph::new(Text::from(vec![
-            Line::from("Add repo"),
+            Line::from("Add mission"),
             line_from_pairs(&[
                 ("Type", "edit path"),
                 ("Enter", "track repo"),
@@ -1260,7 +1307,7 @@ impl DashboardApp {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Filter Workstreams"),
+                .title("Filter Launches"),
         );
 
         frame.render_widget(body, area);
@@ -1357,7 +1404,7 @@ impl DashboardApp {
         let area = centered_rect(58, 30, frame.area());
         frame.render_widget(Clear, area);
         let help = Paragraph::new(Text::from(vec![
-            Line::from(format!("Launch another session for `{}`", modal.branch)),
+            Line::from(format!("Launch another session for launch `{}`", modal.branch)),
             line_from_pairs(&[("↑↓", "move"), ("Enter", "launch"), ("Esc", "cancel")]),
         ]))
         .wrap(Wrap { trim: false })
@@ -1464,7 +1511,7 @@ impl DashboardApp {
             .split(area);
 
         let summary = format!(
-            "Create workstream for {}\nChoose whether to create a new branch from a base branch or use an existing branch directly.",
+            "Create launch for {}\nChoose whether to create a new branch from a base branch or use an existing branch directly.",
             flow.repo_name
         );
 
@@ -1739,12 +1786,7 @@ impl DashboardApp {
             }
             KeyCode::Char('x') => {
                 if let Some(id) = self.selected_workstream_id() {
-                    let result = self
-                        .runtime
-                        .stop_workstream(id)
-                        .map(|branch| format!("Stopped `{branch}`."));
-                    self.set_status_from_result(result);
-                    self.select_workstream_by_id(id);
+                    self.start_stop_workstream(id)?;
                 } else {
                     self.set_status("Select a workstream first.".to_string());
                 }
@@ -1863,12 +1905,7 @@ impl DashboardApp {
                                 self.sync_repo_selection();
                             }
                             ConfirmAction::RemoveWorkstream(workstream_id) => {
-                                let result = self
-                                    .runtime
-                                    .remove_workstream(workstream_id)
-                                    .map(|branch| format!("Removed workstream `{branch}`."));
-                                self.set_status_from_result(result);
-                                self.sync_workstream_selection();
+                                self.start_remove_workstream(workstream_id)?;
                             }
                         }
                     }
@@ -1930,23 +1967,19 @@ impl DashboardApp {
                         } else {
                             model.launch_mode
                         };
-                        let result = self.runtime.create_workstream_session(
+                        let result = self.start_create_workstream_session(
                             model.workstream_id,
                             &agent,
                             runtime_launch_mode,
+                            matches!(model.launch_mode, LaunchMode::Attach),
                         );
                         match result {
-                            Ok(session) => {
-                                self.select_workstream_by_id(model.workstream_id);
-                                self.set_status(format!(
-                                    "Launched {} session `{}`.",
-                                    session.agent_preset, session.session_name
-                                ));
+                            Ok(()) => {
                                 if matches!(model.launch_mode, LaunchMode::Attach) {
-                                    return Ok(DashboardAction::Attach(
-                                        model.workstream_id,
-                                        session.id,
-                                    ));
+                                    self.set_status(
+                                        "Launching session in the background. Attaching when it is ready."
+                                            .to_string(),
+                                    );
                                 }
                             }
                             Err(error) => self.set_status(error.to_string()),
@@ -1988,13 +2021,13 @@ impl DashboardApp {
                             self.modal = Some(Modal::OneOff(model));
                             return Ok(DashboardAction::None);
                         }
-                        match self.runtime.run_workstream_one_off(
+                        match self.start_one_off_task(
                             model.workstream_id,
                             agent,
                             model.prompt.trim(),
                         ) {
-                            Ok(output) => {
-                                model.output = Some(output);
+                            Ok(()) => {
+                                model.output = Some("Running one-off command...".to_string());
                                 self.modal = Some(Modal::OneOff(model));
                             }
                             Err(error) => {
@@ -2050,10 +2083,13 @@ impl DashboardApp {
                             return Ok(DashboardAction::Attach(model.workstream_id, session.id));
                         }
 
-                        let result = self
-                            .runtime
-                            .open_workstream_session(model.workstream_id, session.id)
-                            .map(|_| format!("Opened {} in a new tab.", session.agent_preset));
+                        let result = if self.ensure_workstream_available(model.workstream_id) {
+                            self.runtime
+                                .open_workstream_session(model.workstream_id, session.id)
+                                .map(|_| format!("Opened {} in a new tab.", session.agent_preset))
+                        } else {
+                            Err(anyhow::anyhow!("That workstream is busy right now."))
+                        };
                         self.set_status_from_result(result);
                     }
                     _ => self.modal = Some(Modal::SessionPicker(model)),
@@ -2266,7 +2302,7 @@ impl DashboardApp {
                     };
 
                     let result = match flow.branch_kind {
-                        Some(CreateBranchKind::New) => self.runtime.create_workstream(
+                        Some(CreateBranchKind::New) => self.start_create_workstream(
                             flow.repo_id,
                             WorkstreamRequest::New {
                                 branch: flow.new_branch_input.trim().to_string(),
@@ -2276,15 +2312,13 @@ impl DashboardApp {
                                     .unwrap_or_else(|| "main".to_string()),
                             },
                             &agent,
-                            LaunchMode::Stay,
                         ),
-                        Some(CreateBranchKind::Existing) => self.runtime.create_workstream(
+                        Some(CreateBranchKind::Existing) => self.start_create_workstream(
                             flow.repo_id,
                             WorkstreamRequest::Existing {
                                 branch: flow.selected_existing_branch.clone().unwrap_or_default(),
                             },
                             &agent,
-                            LaunchMode::Stay,
                         ),
                         None => {
                             self.set_status("Choose a branch strategy first.".to_string());
@@ -2293,12 +2327,7 @@ impl DashboardApp {
                     };
 
                     match result {
-                        Ok(workstream) => {
-                            self.select_workstream_by_id(workstream.id);
-                            self.set_status(format!(
-                                "Created workstream `{}` for `{}`.",
-                                workstream.branch, flow.repo_name
-                            ));
+                        Ok(()) => {
                             return Ok(false);
                         }
                         Err(error) => {
@@ -2332,15 +2361,7 @@ impl DashboardApp {
                     self.set_status("Select a repo first.".to_string());
                     return Ok(DashboardAction::None);
                 };
-                let repo_name = self.runtime.repo_by_id(repo_id)?.display_name.clone();
-                match self.runtime.branches_for_repo(repo_id) {
-                    Ok(branches) => {
-                        self.modal = Some(Modal::CreateWorkstream(CreateWorkstreamFlow::new(
-                            repo_id, repo_name, branches,
-                        )));
-                    }
-                    Err(error) => self.set_status(error.to_string()),
-                }
+                self.start_load_branches(repo_id)?;
             }
             PaletteCommand::LaunchWorkstreamSession => {
                 let Some(workstream_id) = self.selected_workstream_id() else {
@@ -2378,11 +2399,7 @@ impl DashboardApp {
                     self.set_status("Select a repo first.".to_string());
                     return Ok(DashboardAction::None);
                 };
-                let result = self
-                    .runtime
-                    .refresh_repo(repo_id)
-                    .map(|_| "Fetched latest refs.".to_string());
-                self.set_status_from_result(result);
+                self.start_refresh_repo(repo_id)?;
             }
             PaletteCommand::RemoveRepo => {
                 let Some(repo_id) = self.selected_repo_id() else {
@@ -2393,7 +2410,7 @@ impl DashboardApp {
                 self.modal = Some(Modal::Confirm(ConfirmModal {
                     title: "Remove Repo".to_string(),
                     body: format!(
-                        "Untrack `{}`?\nThis only removes it from mico. Workstreams must already be removed.",
+                        "Untrack `{}`?\nThis only removes it from mico. Launches must already be removed.",
                         repo.display_name
                     ),
                     action: ConfirmAction::RemoveRepo(repo_id),
@@ -2418,22 +2435,14 @@ impl DashboardApp {
                     self.set_status("Select a workstream first.".to_string());
                     return Ok(DashboardAction::None);
                 };
-                let result = self
-                    .runtime
-                    .resume_workstream(workstream_id, LaunchMode::Stay)
-                    .map(|workstream| format!("Resumed `{}`.", workstream.branch));
-                self.set_status_from_result(result);
+                self.start_resume_workstream(workstream_id)?;
             }
             PaletteCommand::StopWorkstream => {
                 let Some(workstream_id) = self.selected_workstream_id() else {
                     self.set_status("Select a workstream first.".to_string());
                     return Ok(DashboardAction::None);
                 };
-                let result = self
-                    .runtime
-                    .stop_workstream(workstream_id)
-                    .map(|branch| format!("Stopped `{branch}`."));
-                self.set_status_from_result(result);
+                self.start_stop_workstream(workstream_id)?;
             }
             PaletteCommand::RemoveWorkstream => {
                 let Some(workstream_id) = self.selected_workstream_id() else {
@@ -2491,6 +2500,9 @@ impl DashboardApp {
         workstream_id: Uuid,
         launch_mode: LaunchMode,
     ) -> anyhow::Result<DashboardAction> {
+        if !self.ensure_workstream_available(workstream_id) {
+            return Ok(DashboardAction::None);
+        }
         let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
         let Some(session) = workstream.preferred_session().cloned() else {
             self.set_status("This workstream does not have a session yet.".to_string());
@@ -2534,6 +2546,9 @@ impl DashboardApp {
         workstream_id: Uuid,
         launch_mode: LaunchMode,
     ) -> anyhow::Result<DashboardAction> {
+        if !self.ensure_workstream_available(workstream_id) {
+            return Ok(DashboardAction::None);
+        }
         let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
         self.modal = Some(Modal::LaunchSession(LaunchSessionModal {
             workstream_id,
@@ -2551,6 +2566,9 @@ impl DashboardApp {
     }
 
     fn open_one_off_modal(&mut self, workstream_id: Uuid) -> anyhow::Result<DashboardAction> {
+        if !self.ensure_workstream_available(workstream_id) {
+            return Ok(DashboardAction::None);
+        }
         let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
         let agents = one_off_agent_names(&self.runtime);
         if agents.is_empty() {
@@ -2573,6 +2591,417 @@ impl DashboardApp {
             selected,
         }));
         Ok(DashboardAction::None)
+    }
+
+    fn ensure_workstream_available(&mut self, workstream_id: Uuid) -> bool {
+        if self.background_tasks.is_workstream_locked(workstream_id) {
+            let label = self
+                .runtime
+                .workstream_by_id(workstream_id)
+                .map(|workstream| workstream.branch.clone())
+                .unwrap_or_else(|_| "workstream".to_string());
+            self.set_status(format!("`{label}` is already busy with another action."));
+            false
+        } else {
+            true
+        }
+    }
+
+    fn ensure_repo_available(&mut self, repo_id: Uuid) -> bool {
+        if self.background_tasks.is_repo_mutating(repo_id) {
+            let label = self
+                .runtime
+                .repo_by_id(repo_id)
+                .map(|repo| repo.display_name.clone())
+                .unwrap_or_else(|_| "repo".to_string());
+            self.set_status(format!(
+                "`{label}` is already busy with another repo action."
+            ));
+            false
+        } else {
+            true
+        }
+    }
+
+    fn start_load_branches(&mut self, repo_id: Uuid) -> anyhow::Result<()> {
+        if !self.ensure_repo_available(repo_id) {
+            return Ok(());
+        }
+        let repo = self.runtime.repo_by_id(repo_id)?.clone();
+        self.background_tasks
+            .submit(TaskRequest::LoadBranches { repo: repo.clone() })?;
+        self.set_status(format!(
+            "Loading branches for `{}` in the background.",
+            repo.display_name
+        ));
+        Ok(())
+    }
+
+    fn start_refresh_repo(&mut self, repo_id: Uuid) -> anyhow::Result<()> {
+        if !self.ensure_repo_available(repo_id) {
+            return Ok(());
+        }
+        let repo = self.runtime.repo_by_id(repo_id)?.clone();
+        let tracked_workstreams = self
+            .runtime
+            .state
+            .workstreams
+            .iter()
+            .filter(|workstream| workstream.repo_id == repo_id)
+            .map(|workstream| TrackedWorkstreamPath {
+                workstream_id: workstream.id,
+                worktree_path: workstream.worktree_path.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.background_tasks.submit(TaskRequest::RefreshRepo {
+            repo: repo.clone(),
+            tracked_workstreams,
+        })?;
+        self.set_status(format!(
+            "Refreshing `{}` in the background.",
+            repo.display_name
+        ));
+        Ok(())
+    }
+
+    fn start_create_workstream(
+        &mut self,
+        repo_id: Uuid,
+        request: WorkstreamRequest,
+        agent: &str,
+    ) -> anyhow::Result<()> {
+        if !self.ensure_repo_available(repo_id) {
+            return Ok(());
+        }
+        let repo = self.runtime.repo_by_id(repo_id)?.clone();
+        let tracked_worktree_paths = self
+            .runtime
+            .state
+            .workstreams
+            .iter()
+            .filter(|workstream| workstream.repo_id == repo_id)
+            .map(|workstream| workstream.worktree_path.clone())
+            .collect::<Vec<_>>();
+        self.background_tasks
+            .submit(TaskRequest::CreateWorkstream {
+                repo: repo.clone(),
+                request,
+                agent: agent.to_string(),
+                tracked_worktree_paths,
+            })?;
+        self.set_status(format!(
+            "Creating a workstream for `{}` in the background.",
+            repo.display_name
+        ));
+        Ok(())
+    }
+
+    fn start_create_workstream_session(
+        &mut self,
+        workstream_id: Uuid,
+        agent: &str,
+        launch_mode: LaunchMode,
+        attach_after: bool,
+    ) -> anyhow::Result<()> {
+        if !self.ensure_workstream_available(workstream_id) {
+            return Ok(());
+        }
+        let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
+        let repo = self.runtime.repo_by_id(workstream.repo_id)?.clone();
+        let launch_target = if attach_after {
+            SessionLaunchTarget::Attach
+        } else {
+            session_launch_target(launch_mode)
+        };
+        self.background_tasks
+            .submit(TaskRequest::CreateWorkstreamSession {
+                repo,
+                workstream: workstream.clone(),
+                agent: agent.to_string(),
+                launch_target,
+            })?;
+        self.set_status(format!(
+            "Launching a new session for `{}` in the background.",
+            workstream.branch
+        ));
+        Ok(())
+    }
+
+    fn start_resume_workstream(&mut self, workstream_id: Uuid) -> anyhow::Result<()> {
+        if !self.ensure_workstream_available(workstream_id) {
+            return Ok(());
+        }
+        let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
+        let session_id = self.runtime.preferred_session_id(workstream_id)?;
+        let repo = self.runtime.repo_by_id(workstream.repo_id)?.clone();
+        self.background_tasks
+            .submit(TaskRequest::ResumeWorkstreamSession {
+                repo,
+                workstream: workstream.clone(),
+                session_id,
+                launch_target: SessionLaunchTarget::Stay,
+            })?;
+        self.set_status(format!(
+            "Resuming `{}` in the background.",
+            workstream.branch
+        ));
+        Ok(())
+    }
+
+    fn start_stop_workstream(&mut self, workstream_id: Uuid) -> anyhow::Result<()> {
+        if !self.ensure_workstream_available(workstream_id) {
+            return Ok(());
+        }
+        let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
+        self.background_tasks.submit(TaskRequest::StopWorkstream {
+            workstream: workstream.clone(),
+        })?;
+        self.set_status(format!(
+            "Stopping `{}` in the background.",
+            workstream.branch
+        ));
+        Ok(())
+    }
+
+    fn start_remove_workstream(&mut self, workstream_id: Uuid) -> anyhow::Result<()> {
+        if !self.ensure_workstream_available(workstream_id) {
+            return Ok(());
+        }
+        let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
+        let repo = self.runtime.repo_by_id(workstream.repo_id)?.clone();
+        if !self.ensure_repo_available(repo.id) {
+            return Ok(());
+        }
+        self.background_tasks
+            .submit(TaskRequest::RemoveWorkstream {
+                repo,
+                workstream: workstream.clone(),
+            })?;
+        self.set_status(format!(
+            "Removing `{}` in the background.",
+            workstream.branch
+        ));
+        Ok(())
+    }
+
+    fn start_one_off_task(
+        &mut self,
+        workstream_id: Uuid,
+        agent: &str,
+        prompt: &str,
+    ) -> anyhow::Result<()> {
+        if !self.ensure_workstream_available(workstream_id) {
+            return Ok(());
+        }
+        let workstream = self.runtime.workstream_by_id(workstream_id)?.clone();
+        self.background_tasks.submit(TaskRequest::RunOneOff {
+            workstream: workstream.clone(),
+            agent: agent.to_string(),
+            prompt: prompt.to_string(),
+        })?;
+        self.set_status(format!(
+            "Running a one-off {} command for `{}` in the background.",
+            agent, workstream.branch
+        ));
+        Ok(())
+    }
+
+    fn process_deferred_actions(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    ) -> anyhow::Result<()> {
+        while let Some(action) = self.deferred_actions.pop_front() {
+            match action {
+                DeferredAction::Open(workstream_id, session_id) => {
+                    let result = self
+                        .runtime
+                        .open_workstream_session(workstream_id, session_id)
+                        .map(|_| "Opened workstream in a new tab.".to_string());
+                    self.set_status_from_result(result);
+                }
+                DeferredAction::Attach(workstream_id, session_id) => {
+                    suspend_terminal(terminal)?;
+                    let result = self
+                        .runtime
+                        .attach_workstream_session(workstream_id, session_id);
+                    resume_terminal(terminal)?;
+                    self.set_status_from_result(
+                        result.map(|_| "Detached from workstream.".to_string()),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn poll_background_tasks(&mut self) {
+        for update in self.background_tasks.drain_updates() {
+            match update.result {
+                Ok(success) => {
+                    self.apply_background_success(success, update.persisted_completion_id)
+                }
+                Err(error) => {
+                    if let Some(Modal::OneOff(model)) = self.modal.as_mut() {
+                        let matches_workstream = update.locks.iter().any(
+                            |lock| matches!(lock, TaskLock::Workstream(id) if *id == model.workstream_id),
+                        );
+                        if matches_workstream {
+                            model.output = Some(error.to_string());
+                        }
+                    }
+                    self.status = Some(StatusMessage {
+                        text: format!("{} failed: {error}", update.label),
+                        tone: StatusTone::Error,
+                    });
+                }
+            }
+        }
+
+        self.sync_repo_selection();
+        self.sync_workstream_selection();
+    }
+
+    fn apply_background_success(
+        &mut self,
+        success: TaskSuccess,
+        persisted_completion_id: Option<Uuid>,
+    ) {
+        let result = match success {
+            TaskSuccess::BranchesLoaded {
+                repo_id,
+                repo_name,
+                branches,
+            } => {
+                self.select_repo_by_id(repo_id);
+                self.modal = Some(Modal::CreateWorkstream(CreateWorkstreamFlow::new(
+                    repo_id,
+                    repo_name.clone(),
+                    branches,
+                )));
+                Ok(format!("Loaded branches for `{repo_name}`."))
+            }
+            TaskSuccess::RepoRefreshed {
+                repo_id,
+                branch_updates,
+            } => {
+                let repo_name = self
+                    .runtime
+                    .repo_by_id(repo_id)
+                    .map(|repo| repo.display_name.clone())
+                    .unwrap_or_else(|_| "repo".to_string());
+                self.runtime
+                    .apply_branch_updates(branch_updates)
+                    .map(|_| format!("Refreshed `{repo_name}`."))
+            }
+            TaskSuccess::WorkstreamCreated { workstream } => {
+                let branch = workstream.branch.clone();
+                let workstream_id = workstream.id;
+                self.runtime.apply_created_workstream(workstream).map(|_| {
+                    self.select_workstream_by_id(workstream_id);
+                    format!("Created workstream `{branch}`.")
+                })
+            }
+            TaskSuccess::WorkstreamSessionCreated {
+                workstream_id,
+                session,
+                launch_target,
+            } => {
+                let branch = self
+                    .runtime
+                    .workstream_by_id(workstream_id)
+                    .map(|workstream| workstream.branch.clone())
+                    .unwrap_or_else(|_| "workstream".to_string());
+                let agent = session.agent_preset.clone();
+                let session_id = session.id;
+                self.runtime
+                    .apply_created_workstream_session(workstream_id, session)
+                    .map(|_| {
+                        self.schedule_launch_action(launch_target, workstream_id, session_id);
+                        format!("Launched {agent} for `{branch}`.")
+                    })
+            }
+            TaskSuccess::WorkstreamSessionResumed {
+                workstream_id,
+                session_id,
+                launch_target,
+            } => {
+                let branch = self
+                    .runtime
+                    .workstream_by_id(workstream_id)
+                    .map(|workstream| workstream.branch.clone())
+                    .unwrap_or_else(|_| "workstream".to_string());
+                self.runtime
+                    .apply_resumed_workstream_session(workstream_id, session_id)
+                    .map(|_| {
+                        self.schedule_launch_action(launch_target, workstream_id, session_id);
+                        format!("Resumed `{branch}`.")
+                    })
+            }
+            TaskSuccess::WorkstreamStopped { workstream_id } => self
+                .runtime
+                .apply_stopped_workstream(workstream_id)
+                .map(|branch| format!("Stopped `{branch}`.")),
+            TaskSuccess::WorkstreamRemoved { workstream_id } => self
+                .runtime
+                .apply_removed_workstream(workstream_id)
+                .map(|branch| format!("Removed `{branch}`.")),
+            TaskSuccess::OneOffCompleted {
+                workstream_id,
+                output,
+            } => {
+                if let Some(Modal::OneOff(model)) = self.modal.as_mut()
+                    && model.workstream_id == workstream_id
+                {
+                    model.output = Some(output);
+                }
+                let branch = self
+                    .runtime
+                    .workstream_by_id(workstream_id)
+                    .map(|workstream| workstream.branch.clone())
+                    .unwrap_or_else(|_| "workstream".to_string());
+                Ok(format!("One-off completed for `{branch}`."))
+            }
+        };
+
+        match result {
+            Ok(message) => {
+                if let Some(completion_id) = persisted_completion_id
+                    && let Err(error) = self.runtime.completion_store().remove(completion_id)
+                {
+                    self.status = Some(StatusMessage {
+                        text: format!(
+                            "Applied background task but failed to clear completion record: {error}"
+                        ),
+                        tone: StatusTone::Error,
+                    });
+                    return;
+                }
+                self.set_status_good(message)
+            }
+            Err(error) => {
+                self.status = Some(StatusMessage {
+                    text: error.to_string(),
+                    tone: StatusTone::Error,
+                });
+            }
+        }
+    }
+
+    fn schedule_launch_action(
+        &mut self,
+        launch_target: SessionLaunchTarget,
+        workstream_id: Uuid,
+        session_id: Uuid,
+    ) {
+        match launch_target {
+            SessionLaunchTarget::Stay => {}
+            SessionLaunchTarget::Open => self
+                .deferred_actions
+                .push_back(DeferredAction::Open(workstream_id, session_id)),
+            SessionLaunchTarget::Attach => self
+                .deferred_actions
+                .push_back(DeferredAction::Attach(workstream_id, session_id)),
+        }
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -2838,6 +3267,13 @@ impl DashboardApp {
         });
     }
 
+    fn set_status_good(&mut self, message: String) {
+        self.status = Some(StatusMessage {
+            text: message,
+            tone: StatusTone::Good,
+        });
+    }
+
     fn set_status_from_result(&mut self, result: anyhow::Result<String>) {
         match result {
             Ok(message) => {
@@ -2930,6 +3366,14 @@ fn one_off_agent_names(runtime: &MicoRuntime) -> Vec<String> {
         .filter(|preset| preset.one_off_command.is_some())
         .map(|preset| preset.name.clone())
         .collect()
+}
+
+fn session_launch_target(launch_mode: LaunchMode) -> SessionLaunchTarget {
+    match launch_mode {
+        LaunchMode::Stay => SessionLaunchTarget::Stay,
+        LaunchMode::Open => SessionLaunchTarget::Open,
+        LaunchMode::Attach => SessionLaunchTarget::Attach,
+    }
 }
 
 fn line_from_pairs(items: &[(&str, &str)]) -> Line<'static> {

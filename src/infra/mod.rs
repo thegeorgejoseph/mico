@@ -6,4 +6,5 @@ pub mod json_store;
 pub mod operations;
 pub mod platform;
 pub mod process;
+pub mod task_store;
 pub mod tmux;

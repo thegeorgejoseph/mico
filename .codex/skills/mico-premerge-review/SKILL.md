@@ -26,6 +26,7 @@ Prioritize:
 
 3. Review with findings first.
 Do not lead with a summary. List concrete findings ordered by severity, with file references and short explanations of impact.
+For each finding, include at least one potential solution. When there is more than one reasonable fix, list the main options and give short pros/cons so the user can choose an approach quickly.
 
 4. Focus on mico-specific failure modes.
 Look especially for:
@@ -52,6 +53,8 @@ If no findings are present, say that explicitly and mention remaining gaps such 
 
 - Findings first, ordered by severity.
 - Use clickable file references.
+- After each finding, include `Potential solutions:` with 1-3 practical options.
+- For each option, include short `Pros:` and `Cons:` lines focused on implementation risk, UX impact, and long-term maintainability.
 - Keep summaries short.
 - Mention commands you ran when relevant.
 

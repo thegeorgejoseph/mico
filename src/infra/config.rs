@@ -11,6 +11,7 @@ pub fn resolve_paths() -> anyhow::Result<AppPaths> {
         config_path: root.join("config.json"),
         state_path: root.join("state.json"),
         operations_log_path: root.join("operations.jsonl"),
+        task_results_path: root.join("task-results.json"),
         worktrees_root: root.join("worktrees"),
         root,
     })

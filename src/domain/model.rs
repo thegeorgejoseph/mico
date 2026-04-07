@@ -9,6 +9,7 @@ pub struct AppPaths {
     pub config_path: PathBuf,
     pub state_path: PathBuf,
     pub operations_log_path: PathBuf,
+    pub task_results_path: PathBuf,
     pub worktrees_root: PathBuf,
 }
 

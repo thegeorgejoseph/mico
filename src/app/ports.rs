@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 
+use uuid::Uuid;
+
+use crate::app::background::PersistedTaskCompletion;
 use crate::domain::model::{
     AppConfig, DoctorReport, OperationEvent, RepoTarget, StoredState, WorktreePlan,
 };
@@ -103,6 +106,12 @@ pub trait CommandRunner {
 pub trait OperationLog {
     fn record(&self, event: &OperationEvent) -> anyhow::Result<()>;
     fn recent(&self, limit: usize) -> anyhow::Result<Vec<OperationEvent>>;
+}
+
+pub trait TaskCompletionStore {
+    fn load(&self) -> anyhow::Result<Vec<PersistedTaskCompletion>>;
+    fn append(&self, completion: &PersistedTaskCompletion) -> anyhow::Result<()>;
+    fn remove(&self, completion_id: Uuid) -> anyhow::Result<()>;
 }
 
 pub trait Updater {
