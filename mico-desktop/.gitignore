@@ -1,0 +1,7 @@
+app/node_modules/
+app/dist/
+backend/bin/
+dist/
+*.dmg
+*.sha256
+.DS_Store

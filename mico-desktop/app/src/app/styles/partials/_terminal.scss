@@ -1,0 +1,255 @@
+@use "./tokens" as *;
+
+.terminal-card {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid $border;
+  border-radius: $radius-panel;
+  background: $terminal;
+  box-shadow: $shadow-soft;
+}
+
+.terminal-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 10px;
+  align-items: center;
+  padding: 12px 14px;
+  border-bottom: 1px solid $border;
+  background: $surface-solid;
+
+  h2 {
+    font-family: $font-display;
+    color: #f3f4f6;
+    font-size: 14px;
+    font-weight: 620;
+  }
+
+  p {
+    color: #9ca3af;
+    font-size: 12px;
+  }
+
+  &__controls {
+    display: grid;
+    grid-template-columns: 132px auto;
+    gap: 8px;
+    align-items: center;
+  }
+
+  &__title {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  &__badge {
+    display: inline-flex;
+    width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid $border;
+    border-radius: $radius-control;
+    color: #cdd8e5;
+    background: rgba(255, 255, 255, 0.03);
+    flex-shrink: 0;
+  }
+
+  &__actions {
+    display: inline-flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+}
+
+body[data-platform="darwin"] .terminal-header {
+  background: rgba(28, 31, 36, 0.9);
+}
+
+.session-tabs {
+  display: flex;
+  grid-column: 1 / -1;
+  gap: 6px;
+  overflow-x: auto;
+
+  button {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 1px solid $border;
+    border-radius: 999px;
+    padding: 4px 10px;
+    color: #cbd5e1;
+    background: rgba(255, 255, 255, 0.04);
+    cursor: pointer;
+
+    &.is-active {
+      color: #fff;
+      border-color: var(--theme-accent-tint-34);
+      background: var(--theme-accent-tint-18);
+    }
+
+    &:focus-visible {
+      outline: none;
+      border-color: var(--theme-accent-tint-34);
+      box-shadow: 0 0 0 3px var(--theme-accent-tint-12);
+    }
+  }
+
+  &__icon {
+    display: inline-flex;
+  }
+}
+
+.terminal-viewport {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: $terminal;
+}
+
+.terminal-xterm {
+  width: 100%;
+  height: 100%;
+  padding: 10px 12px;
+  overflow: hidden;
+
+  &__host {
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+  }
+
+  .xterm {
+    height: 100%;
+    font-family: $font-mono;
+  }
+
+  .xterm-viewport {
+    overflow-y: auto;
+  }
+}
+
+.terminal-status {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  color: #9ca3af;
+  background: rgba(13, 15, 18, 0.9);
+  font-size: 12px;
+}
+
+.activity-panel {
+  display: grid;
+  min-height: 0;
+  overflow: hidden;
+  border: 1px solid $border;
+  border-radius: $radius-panel;
+  background: $surface;
+
+  &.is-open {
+    grid-template-rows: auto minmax(0, 176px);
+  }
+
+  &.is-collapsed {
+    min-height: 42px;
+  }
+}
+
+.activity-toggle {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+  width: 100%;
+  min-height: 42px;
+  border: 0;
+  padding: 8px 12px;
+  color: $text;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.04);
+  cursor: pointer;
+
+  span {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  strong {
+    color: $text;
+    font-size: 12px;
+  }
+
+  em {
+    overflow: hidden;
+    color: $muted;
+    font-size: 12px;
+    font-style: normal;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  small {
+    color: $muted;
+    font-size: 12px;
+  }
+}
+
+.activity-list {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  overflow: auto;
+  padding: 10px;
+}
+
+.activity-item {
+  display: grid;
+  gap: 4px;
+  padding: 7px 10px;
+  border-left: 2px solid $border-strong;
+  border-radius: 0 $radius-control $radius-control 0;
+  background: rgba(255, 255, 255, 0.025);
+
+  strong {
+    color: $text;
+    font-size: 12px;
+  }
+
+  span {
+    color: $muted;
+    font-size: 12px;
+    line-height: 1.35;
+  }
+
+  &--error {
+    border-left-color: $error;
+  }
+
+  &--warn {
+    border-left-color: $warning;
+  }
+
+  &--info {
+    border-left-color: $info;
+  }
+
+  &__title {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  &__icon {
+    display: inline-flex;
+    color: rgba(255, 255, 255, 0.76);
+  }
+}

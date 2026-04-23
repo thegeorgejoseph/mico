@@ -1,0 +1,30 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="52" y1="28" x2="460" y2="486" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2A2F3B"/>
+      <stop offset="1" stop-color="#171B24"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(256 188) rotate(90) scale(204 212)">
+      <stop stop-color="#A455FF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#A455FF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="accent" x1="160" y1="144" x2="366" y2="344" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#C68EFF"/>
+      <stop offset="1" stop-color="#A455FF"/>
+    </linearGradient>
+    <filter id="soft" x="98" y="106" width="316" height="296" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+
+  <rect x="0" y="0" width="512" height="512" fill="url(#bg)"/>
+  <rect x="6" y="6" width="500" height="500" rx="124" fill="none" stroke="#A455FF" stroke-opacity="0.16" stroke-width="8"/>
+  <rect x="16" y="16" width="480" height="480" rx="124" fill="url(#glow)"/>
+
+  <path d="M150 336V176L210 246L256 192L302 246L362 176V336" stroke="#A455FF" stroke-opacity="0.16" stroke-width="34" stroke-linecap="round" stroke-linejoin="round" filter="url(#soft)"/>
+  <path d="M150 336V176L210 246L256 192L302 246L362 176V336" stroke="url(#accent)" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <path d="M154 128C177 109 211 96 256 96C341 96 408 151 414 231" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="10" stroke-linecap="round"/>
+  <circle cx="406" cy="226" r="14" fill="#A455FF"/>
+  <circle cx="406" cy="226" r="25" fill="#A455FF" fill-opacity="0.12"/>
+</svg>
