@@ -7,7 +7,7 @@ description: Review the mico codebase before merging to main. Use this when the 
 
 ## Overview
 
-Use this skill for pre-merge review work in `mico`. It focuses on concrete bugs, security and integrity risks, Rust type-safety issues, and regressions in the git/tmux/TUI workflow.
+Use this skill for pre-merge review work in `mico`. It focuses on concrete bugs, security and integrity risks, Rust type-safety issues, regressions in the git/tmux/TUI workflow, and production-readiness concerns in newer desktop/Electron/Go code.
 
 ## Workflow
 
@@ -38,7 +38,18 @@ Look especially for:
 - TUI logic that can desync selection, views, or stored status
 - lint/type-safety regressions, especially anything that breaks `cargo clippy`
 
-5. Call out residual risk after findings.
+5. Review architecture and ownership, not just line-by-line correctness.
+Look for:
+- whether package/module boundaries are clean and tell a clear story of who owns what
+- single-responsibility violations such as god files, transport layers doing domain work, or UI shells owning business logic
+- incorrect ownership of boot/runtime concerns across Electron main, preload, renderer, and backend services
+- encapsulation problems, especially shared mutable state, persistence layers leaking into feature code, or features bypassing the intended abstraction
+- circular or suspicious dependency directions, even if the code still compiles
+- production risks such as dev-only boot assumptions, hardcoded local environment expectations, or background polling that can degrade responsiveness
+- whether the frontend and backend layers are separated cleanly, with the right layer owning state transitions, side effects, and IPC/API contracts
+- whether changes preserve backwards compatibility with existing mico state, worktrees, and sessions
+
+6. Call out residual risk after findings.
 If no findings are present, say that explicitly and mention remaining gaps such as missing tests, missing migration coverage, or manual-only flows.
 
 ## Mico Heuristics
@@ -48,6 +59,9 @@ If no findings are present, say that explicitly and mention remaining gaps such 
 - Be suspicious of direct filesystem writes to persistent state, non-atomic updates, and best-effort cleanup paths.
 - When a workstream points at an existing checkout, verify that remove/reconcile/open flows cannot damage the original repo checkout.
 - When reviewing TUI changes, ask whether the label teaches the feature. If the user would need hidden knowledge to understand a panel, call that out.
+- For desktop code, audit startup and shutdown paths carefully: packaged apps should not depend on dev-only tools, and the app should fail cleanly if critical background services cannot start.
+- When a diff touches relatively few files but changes a lot of lines, explicitly ask whether responsibilities are being concentrated into too few files.
+- Prefer findings about boundary erosion, ownership confusion, and production unsafety over purely stylistic observations.
 
 ## Output Style
 

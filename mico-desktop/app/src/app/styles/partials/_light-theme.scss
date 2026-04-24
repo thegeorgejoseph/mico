@@ -1,0 +1,147 @@
+@use "./tokens" as *;
+
+body[data-theme="light"] p,
+body[data-theme="light"] .nav-section__collapsed-meta,
+body[data-theme="light"] .list-item span,
+body[data-theme="light"] .list-item em,
+body[data-theme="light"] .summary-metric__label,
+body[data-theme="light"] .settings-section__header span,
+body[data-theme="light"] .doctor-item span,
+body[data-theme="light"] .doctor-item em {
+  color: #6b6f75;
+}
+
+body[data-theme="light"] .section-title button,
+body[data-theme="light"] .toolbar-icon,
+body[data-theme="light"] .toolbar-update,
+body[data-theme="light"] .ui-button,
+body[data-theme="light"] .ui-field,
+body[data-theme="light"] .sidebar__preferences,
+body[data-theme="light"] .app-settings-row,
+body[data-theme="light"] .status-chip,
+body[data-theme="light"] .panel-group,
+body[data-theme="light"] .activity-panel,
+body[data-theme="light"] .terminal-card,
+body[data-theme="light"] .summary-metric,
+body[data-theme="light"] .worktree-mode,
+body[data-theme="light"] .side-sheet,
+body[data-theme="light"] .command-palette,
+body[data-theme="light"] .modal,
+body[data-theme="light"] .preferences-panel {
+  color: #17191e;
+  border-color: rgba(31, 35, 42, 0.08);
+  background: rgba(248, 247, 243, 0.78);
+}
+
+body[data-theme="light"] .toolbar,
+body[data-theme="light"] .terminal-header {
+  background: rgba(242, 241, 237, 0.82);
+  border-color: rgba(31, 35, 42, 0.08);
+}
+
+body[data-theme="light"] .terminal-card,
+body[data-theme="light"] .terminal-viewport {
+  background: #f6f3ee;
+}
+
+body[data-theme="light"] .terminal-header h2,
+body[data-theme="light"] .session-tabs button.is-active,
+body[data-theme="light"] .terminal-header__badge {
+  color: #17191e;
+}
+
+body[data-theme="light"] .terminal-header p,
+body[data-theme="light"] .session-tabs button {
+  color: #6b6f75;
+}
+
+body[data-theme="light"] .session-tabs button {
+  background: rgba(255, 255, 255, 0.55);
+}
+
+body[data-theme="light"] .session-tabs button.is-active {
+  border-color: var(--theme-accent-light-tint-34);
+  background: var(--theme-accent-light-tint-14);
+}
+
+body[data-theme="light"] .terminal-header__badge {
+  background: rgba(255, 255, 255, 0.5);
+}
+
+body[data-theme="light"] .terminal-status {
+  color: #6b6f75;
+  background: rgba(246, 243, 238, 0.92);
+}
+
+body[data-theme="light"] .brand__collapse,
+body[data-theme="light"] .compact-project span,
+body[data-theme="light"] .resize-handle::before {
+  color: #6b6f75;
+}
+
+body[data-theme="light"] .brand__collapse:hover,
+body[data-theme="light"] .compact-project:hover,
+body[data-theme="light"] .sidebar-logo-button:hover {
+  color: #17191e;
+  background: rgba(23, 25, 30, 0.08);
+}
+
+body[data-theme="light"] .sidebar-logo-button,
+body[data-theme="light"] .sidebar-search__result,
+body[data-theme="light"] .sidebar-search__results,
+body[data-theme="light"] .sidebar-search__empty {
+  border-color: rgba(31, 35, 42, 0.08);
+  background: rgba(248, 247, 243, 0.78);
+}
+
+body[data-theme="light"] .sidebar-search__result:hover,
+body[data-theme="light"] .sidebar-search__result.is-highlighted {
+  border-color: var(--theme-accent-light-tint-24);
+  background: var(--theme-accent-light-tint-10);
+}
+
+body[data-theme="light"] .resize-handle::before {
+  background: rgba(31, 35, 42, 0.12);
+}
+
+body[data-theme="light"] .workspace h2,
+body[data-theme="light"] .panel-heading h2,
+body[data-theme="light"] .app-settings-row strong,
+body[data-theme="light"] .summary-metric strong,
+body[data-theme="light"] .list-item strong,
+body[data-theme="light"] .doctor-item__title strong,
+body[data-theme="light"] .settings-section__header strong,
+body[data-theme="light"] .preferences-tabs button {
+  color: #17191e;
+}
+
+body[data-theme="light"] .terminal-xterm {
+  background: #f6f3ee;
+}
+
+body[data-theme="light"] .toolbar-update {
+  border-color: var(--theme-accent-tint-42);
+  color: #fff;
+  background: $accent;
+}
+
+.modal-form {
+  display: grid;
+  gap: 12px;
+
+  label {
+    display: grid;
+    gap: 6px;
+  }
+
+  label span {
+    color: $muted;
+    font-size: 12px;
+  }
+}
+
+.path-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}

@@ -1,0 +1,10 @@
+{
+  "name": "mico-desktop-workspace",
+  "private": true,
+  "scripts": {
+    "backend:test": "cd backend && go test ./...",
+    "backend:run": "cd backend && go run ./cmd/mico-desktop",
+    "app:dev": "make dev",
+    "test": "make test"
+  }
+}

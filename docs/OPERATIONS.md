@@ -18,7 +18,7 @@ There is also a GitHub Releases bootstrap path through `install.sh`:
 curl -fsSL https://raw.githubusercontent.com/thegeorgejoseph/mico/main/install.sh | sh
 ```
 
-If `mico` was installed through Homebrew, `mico install` runs a targeted Homebrew install/upgrade for the `mico` formula. If it was installed from GitHub Releases, `mico install` reinstalls from the latest GitHub release.
+If `mico` was installed through Homebrew or GitHub Releases, rerun the original install path to pick up the latest published build.
 
 The updater can use either:
 
