@@ -26,6 +26,6 @@
 
 ## Product direction
 
-- Install story: Homebrew cask first, signed GitHub release second.
+- Install story: `mico-desktop` Homebrew cask first, signed GitHub release second.
 - Update story today: Settings opens the latest signed release.
 - Agent story: local Codex/Claude CLIs reason over typed mico tool contracts; they do not scrape the UI.

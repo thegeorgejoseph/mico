@@ -10,19 +10,19 @@ Ship a signed macOS `mico.app` in GitHub Releases and keep the Homebrew cask poi
 make test
 make prod-local-build
 make prod-local-run
-make release-stage VERSION=1.0.0
+MICO_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" make release-macos VERSION=1.0.0
 ```
 
-## Manual release steps
+## What the release helper does
 
-1. sign the staged app
-2. package and notarize the DMG
-3. upload the signed release assets
-4. update the Homebrew cask metadata
-5. smoke test install, launch, backend startup, worktree creation, and session launch
+1. stages `mico.app`
+2. signs the app with a Developer ID Application certificate
+3. builds `mico-desktop-arm64.dmg`
+4. notarizes and staples the DMG using the `mico-notary` keychain profile
+5. uploads the DMG and checksum to the GitHub release for the matching tag
 
 ## Expected release shape
 
 - GitHub Release: signed DMG for `mico`
-- Homebrew: `brew install --cask mico`
+- Homebrew: `brew install --cask thegeorgejoseph/tap/mico-desktop`
 - In-app updates: Settings opens the same signed release channel

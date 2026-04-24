@@ -1,4 +1,4 @@
-.PHONY: install dev test build prod-local-build prod-local-run release-stage clean
+.PHONY: install dev test build prod-local-build prod-local-run release-stage release-macos clean
 
 install:
 	npm install --package-lock-only
@@ -27,6 +27,13 @@ release-stage:
 		exit 1; \
 	fi
 	./scripts/stage-release.sh "$(VERSION)"
+
+release-macos:
+	@if [ -z "$(VERSION)" ]; then \
+		echo "usage: make release-macos VERSION=x.y.z" >&2; \
+		exit 1; \
+	fi
+	./scripts/release-macos.sh "$(VERSION)"
 
 clean:
 	rm -rf app/dist app/node_modules backend/bin dist

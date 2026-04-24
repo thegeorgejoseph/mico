@@ -18,7 +18,7 @@ make build
 
 ## Product shape
 
-- Primary install path: `brew install --cask mico` from `thegeorgejoseph/homebrew-tap`
+- Primary install path: `brew install --cask thegeorgejoseph/tap/mico-desktop`
 - Fallback install path: latest signed GitHub Release DMG
 - Update path today: in-app Settings opens the current signed release
 - Backend responsibilities: repos, worktrees, sessions, logs, notifications, agent actions, and navigation state

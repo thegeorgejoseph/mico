@@ -5,7 +5,7 @@
 Preferred path:
 
 ```sh
-brew install --cask mico
+brew install --cask thegeorgejoseph/tap/mico-desktop
 ```
 
 Fallback path:
@@ -22,7 +22,5 @@ Fallback path:
 1. `make test`
 2. `make prod-local-build`
 3. `make prod-local-run`
-4. `make release-stage VERSION=x.y.z`
-5. sign and notarize the staged app/DMG outside the repo
-6. publish the signed release
-7. update the Homebrew cask metadata
+4. `MICO_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" make release-macos VERSION=x.y.z`
+5. smoke test install, launch, backend startup, worktree creation, and session launch
