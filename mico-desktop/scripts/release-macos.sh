@@ -55,14 +55,8 @@ make prod-local-build
 echo "==> staging release inputs"
 make release-stage VERSION="${VERSION}"
 
-if [ ! -d "${APP_BUNDLE}" ]; then
-  echo "missing app bundle at ${APP_BUNDLE}" >&2
-  exit 1
-fi
-
 echo "==> signing ${APP_BUNDLE}"
-codesign --force --deep --options runtime --timestamp --sign "${CODESIGN_IDENTITY}" "${APP_BUNDLE}"
-codesign --verify --deep --strict --verbose=2 "${APP_BUNDLE}"
+"${ROOT_DIR}/scripts/sign-macos-app.sh" "${APP_BUNDLE}" "${CODESIGN_IDENTITY}"
 
 echo "==> packaging DMG"
 "${ROOT_DIR}/scripts/create-macos-dmg.sh" "${APP_BUNDLE}" "${VERSIONED_DMG}"
