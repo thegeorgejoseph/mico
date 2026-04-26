@@ -17,6 +17,7 @@ import (
 	"github.com/thegeorgejoseph/mico/mico-desktop/backend/services/navigation"
 	"github.com/thegeorgejoseph/mico/mico-desktop/backend/services/notifications"
 	"github.com/thegeorgejoseph/mico/mico-desktop/backend/services/repos"
+	"github.com/thegeorgejoseph/mico/mico-desktop/backend/services/runtimepath"
 	"github.com/thegeorgejoseph/mico/mico-desktop/backend/services/sessions"
 	"github.com/thegeorgejoseph/mico/mico-desktop/backend/services/state"
 	"github.com/thegeorgejoseph/mico/mico-desktop/backend/services/worktrees"
@@ -31,6 +32,10 @@ func main() {
 	worktreesRoot := flag.String("worktrees", filepath.Join(defaultRoot, "worktrees"), "root directory for worktrees")
 	legacyStatePath := flag.String("legacy-state", migrations.DefaultLegacyStatePath(), "path to existing Rust CLI state JSON to import")
 	flag.Parse()
+
+	if err := runtimepath.NewService().Configure(); err != nil {
+		log.Printf("warning: failed to configure runtime PATH: %v", err)
+	}
 
 	store := state.NewStore(*statePath)
 	logService := logs.NewService(store)
